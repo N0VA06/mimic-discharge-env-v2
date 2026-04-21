@@ -1,0 +1,33 @@
+# Training artifacts — not needed at inference time
+training/
+checkpoints/
+wandb/
+unsloth_compiled_cache/
+
+# Logs and databases
+logs/
+*.log
+mlflow.db
+*.sqlite
+
+# Dev / CI
+.git/
+.github/
+.vscode/
+.idea/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Secrets
+.env
+.env.local
+
+# Docs (already in README)
+explanation.md
+baseline_results.txt
+
+# macOS
+.DS_Store

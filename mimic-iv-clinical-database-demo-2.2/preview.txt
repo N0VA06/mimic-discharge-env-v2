@@ -1,0 +1,256 @@
+
+===== ./demo_subject_id.csv =====
+ subject_id
+   10000032
+   10001217
+   10001725
+   10002428
+   10002495
+
+===== ./hosp/drgcodes.csv =====
+ subject_id  hadm_id drg_type  drg_code                                                         description  drg_severity  drg_mortality
+   10004235 22187210     HCFA       864                                                               FEVER           NaN            NaN
+   10026255 22059910     HCFA       180                                         RESPIRATORY NEOPLASMS W MCC           NaN            NaN
+   10032725 20611640     HCFA        54                                      NERVOUS SYSTEM NEOPLASMS W MCC           NaN            NaN
+   10005866 21636229     HCFA       393                              OTHER DIGESTIVE SYSTEM DIAGNOSES W MCC           NaN            NaN
+   10008454 20291550     HCFA       956 LIMB REATTACHMENT, HIP & FEMUR PROC FOR MULTIPLE SIGNIFICANT TRAUMA           NaN            NaN
+
+===== ./hosp/d_icd_diagnoses.csv =====
+ icd_code  icd_version                                                                                                                                                                              long_title
+       90            9                                                                                                                                      Infectious colitis, enteritis, and gastroenteritis
+     1160            9                                                                                                                                           Tuberculous pneumonia [any form], unspecified
+     1186            9 Other specified pulmonary tuberculosis, tubercle bacilli not found by bacteriological or histological examination, but tuberculosis confirmed by other methods [inoculation of animals]
+     1200            9                                                                                                                                                       Tuberculous pleurisy, unspecified
+     1236            9                 Tuberculous laryngitis, tubercle bacilli not found by bacteriological or histological examination, but tuberculosis confirmed by other methods [inoculation of animals]
+
+===== ./hosp/hcpcsevents.csv =====
+ subject_id  hadm_id  chartdate  hcpcs_cd  seq_num short_description
+   10005348 29176490 2129-05-22     93454        1    Cardiovascular
+   10005348 29176490 2129-05-22     92921        2    Cardiovascular
+   10004457 21039249 2140-09-17     92980        1    Cardiovascular
+   10004457 25559382 2148-09-14     93455        1    Cardiovascular
+   10039708 27504040 2142-07-06     64415        2    Nervous system
+
+===== ./hosp/provider.csv =====
+provider_id
+     P003F3
+     P005JG
+     P005MB
+     P00707
+     P009IB
+
+===== ./hosp/procedures_icd.csv =====
+ subject_id  hadm_id  seq_num  chartdate  icd_code  icd_version
+   10011398 27505812        3 2146-12-15      3961            9
+   10011398 27505812        2 2146-12-15      3615            9
+   10011398 27505812        1 2146-12-15      3614            9
+   10014729 23300884        4 2125-03-23      3897            9
+   10014729 23300884        1 2125-03-20      3403            9
+
+===== ./hosp/patients.csv =====
+ subject_id gender  anchor_age  anchor_year anchor_year_group        dod
+   10014729      F          21         2125       2011 - 2013        NaN
+   10003400      F          72         2134       2011 - 2013 2137-09-02
+   10002428      F          80         2155       2011 - 2013        NaN
+   10032725      F          38         2143       2011 - 2013 2143-03-30
+   10027445      F          48         2142       2011 - 2013 2146-02-09
+
+===== ./hosp/omr.csv =====
+ subject_id  chartdate  seq_num     result_name  result_value
+   10011398 2146-12-01        1 Height (Inches)            63
+   10011398 2147-01-22        1    Weight (Lbs)           127
+   10011398 2146-12-01        1    Weight (Lbs)           135
+   10011398 2147-07-24        1    Weight (Lbs)           136
+   10011398 2147-03-26        1    Weight (Lbs)           136
+
+===== ./hosp/microbiologyevents.csv =====
+ microevent_id  subject_id  hadm_id  micro_specimen_id  order_provider_id           chartdate           charttime  spec_itemid spec_type_desc  test_seq           storedate           storetime  test_itemid                             test_name  org_itemid         org_name  isolate_num  quantity  ab_itemid    ab_name dilution_text  dilution_comparison  dilution_value interpretation           comments
+            36    10000032 25742920            7814634                NaN 2180-08-06 00:00:00 2180-08-06 20:35:00        70070           SWAB         1 2180-08-08 00:00:00 2180-08-08 08:03:00        90115 R/O VANCOMYCIN RESISTANT ENTEROCOCCUS         NaN              NaN          NaN       NaN        NaN        NaN           NaN                  NaN             NaN            NaN No VRE isolated.  
+            15    10000032 22595853            5717063                NaN 2180-05-07 00:00:00 2180-05-07 00:19:00        70070           SWAB         1 2180-05-09 00:00:00 2180-05-09 07:57:00        90115 R/O VANCOMYCIN RESISTANT ENTEROCOCCUS         NaN              NaN          NaN       NaN        NaN        NaN           NaN                  NaN             NaN            NaN No VRE isolated.  
+            32    10000032 29079034            5901894                NaN 2180-07-24 00:00:00 2180-07-24 00:55:00        70070           SWAB         1 2180-07-27 00:00:00 2180-07-27 11:15:00        90115 R/O VANCOMYCIN RESISTANT ENTEROCOCCUS         NaN              NaN          NaN       NaN        NaN        NaN           NaN                  NaN             NaN            NaN No VRE isolated.  
+          7013    10020944 29974575            4646730                NaN 2131-02-27 00:00:00 2131-02-27 17:41:00        70070           SWAB         1 2131-03-03 00:00:00 2131-03-03 13:09:00        90115 R/O VANCOMYCIN RESISTANT ENTEROCOCCUS     80053.0 ENTEROCOCCUS SP.          1.0       NaN    90015.0 VANCOMYCIN          >256                  NaN             NaN              R                NaN
+         12898    10037975 27617929            1636367                NaN 2185-01-17 00:00:00 2185-01-17 21:32:00        70070           SWAB         1 2185-01-20 00:00:00 2185-01-20 07:56:00        90115 R/O VANCOMYCIN RESISTANT ENTEROCOCCUS         NaN              NaN          NaN       NaN        NaN        NaN           NaN                  NaN             NaN            NaN No VRE isolated.  
+
+===== ./hosp/poe_detail.csv =====
+      poe_id  poe_seq  subject_id          field_name field_value
+ 10011398-23       23    10011398            Admit to     Surgery
+10011398-103      103    10011398         Transfer to     Surgery
+10011398-163      163    10011398  Discharge Planning   Finalized
+10011398-109      109    10011398 Tubes & Drains type  Chest tube
+ 10011398-35       35    10011398 Tubes & Drains type  Chest tube
+
+===== ./hosp/prescriptions.csv =====
+ subject_id  hadm_id  pharmacy_id  poe_id  poe_seq  order_provider_id           starttime  stoptime drug_type             drug formulary_drug_cd  gsn  ndc  prod_strength  form_rx  dose_val_rx  dose_unit_rx  form_val_disp  form_unit_disp  doses_per_24_hrs  route
+   10027602 28166872     27168639     NaN      NaN                NaN 2201-10-30 12:00:00       NaN      MAIN Fentanyl Citrate            FENT2I  NaN  NaN            NaN      NaN          NaN           NaN            NaN             NaN               NaN    NaN
+   10027602 28166872     40720238     NaN      NaN                NaN 2201-10-30 12:00:00       NaN      MAIN Fentanyl Citrate            FENT2I  NaN  NaN            NaN      NaN          NaN           NaN            NaN             NaN               NaN    NaN
+   10027602 28166872     62845687     NaN      NaN                NaN 2201-10-31 12:00:00       NaN      MAIN        Lorazepam            LORA2I  NaN  NaN            NaN      NaN          NaN           NaN            NaN             NaN               NaN    NaN
+   10027602 28166872     24340150     NaN      NaN                NaN 2201-10-30 12:00:00       NaN      MAIN        Midazolam            MIDA2I  NaN  NaN            NaN      NaN          NaN           NaN            NaN             NaN               NaN    NaN
+   10027602 28166872     14435820     NaN      NaN                NaN 2201-10-30 12:00:00       NaN      MAIN        Midazolam            MIDA2I  NaN  NaN            NaN      NaN          NaN           NaN            NaN             NaN               NaN    NaN
+
+===== ./hosp/services.csv =====
+ subject_id  hadm_id        transfertime  prev_service curr_service
+   10001725 25563031 2110-04-11 15:09:36           NaN          GYN
+   10019003 28003918 2148-12-21 03:32:53           NaN          GYN
+   10007818 22987108 2146-06-10 16:38:18           NaN          MED
+   10004235 24181354 2196-02-24 14:39:31           NaN          MED
+   10026255 22059910 2201-07-07 18:16:14           NaN          MED
+
+===== ./hosp/d_hcpcs.csv =====
+ code  category                                                      long_description short_description
+TD          NaN                                                                    Rn                Rn
+A0428       NaN Ambulance service, basic life support, non-emergency transport, (bls)               Bls
+V5272       NaN                                       Assistive listening device, tdd               Tdd
+S2080       NaN                               Laser-assisted uvulopalatoplasty (laup)              Laup
+S8037       NaN                    Magnetic resonance cholangiopancreatography (mrcp)              Mrcp
+
+===== ./hosp/admissions.csv =====
+ subject_id  hadm_id           admittime           dischtime           deathtime admission_type admit_provider_id     admission_location       discharge_location insurance language marital_status                           race           edregtime           edouttime  hospital_expire_flag
+   10004235 24181354 2196-02-24 14:38:00 2196-03-04 14:02:00                 NaN         URGENT            P03YMR TRANSFER FROM HOSPITAL SKILLED NURSING FACILITY  Medicaid  ENGLISH         SINGLE             BLACK/CAPE VERDEAN 2196-02-24 12:15:00 2196-02-24 17:07:00                     0
+   10009628 25926192 2153-09-17 17:08:00 2153-09-25 13:20:00                 NaN         URGENT            P41R5N TRANSFER FROM HOSPITAL         HOME HEALTH CARE  Medicaid        ?        MARRIED HISPANIC/LATINO - PUERTO RICAN                 NaN                 NaN                     0
+   10018081 23983182 2134-08-18 02:02:00 2134-08-23 19:35:00                 NaN         URGENT            P233F6 TRANSFER FROM HOSPITAL SKILLED NURSING FACILITY  Medicare  ENGLISH        MARRIED                          WHITE 2134-08-17 16:24:00 2134-08-18 03:15:00                     0
+   10006053 22942076 2111-11-13 23:39:00 2111-11-15 17:20:00 2111-11-15 17:20:00         URGENT            P38TI6 TRANSFER FROM HOSPITAL                     DIED  Medicaid  ENGLISH            NaN                        UNKNOWN                 NaN                 NaN                     1
+   10031404 21606243 2113-08-04 18:46:00 2113-08-06 20:57:00                 NaN         URGENT            P07HDB TRANSFER FROM HOSPITAL                     HOME     Other  ENGLISH        WIDOWED                          WHITE                 NaN                 NaN                     0
+
+===== ./hosp/poe.csv =====
+      poe_id  poe_seq  subject_id  hadm_id           ordertime   order_type     order_subtype transaction_type  discontinue_of_poe_id  discontinued_by_poe_id order_provider_id order_status
+10002930-456      456    10002930 20282368 2201-03-23 19:14:33 General Care             Other              New                    NaN                     NaN            P04TDP     Inactive
+10002930-454      454    10002930 20282368 2201-03-23 19:14:33 General Care Vitals/Monitoring              New                    NaN                     NaN            P04TDP     Inactive
+10002930-455      455    10002930 20282368 2201-03-23 19:14:33 General Care          Activity              New                    NaN                     NaN            P04TDP     Inactive
+10002930-453      453    10002930 20282368 2201-03-23 19:14:33   IV therapy         IV access              New                    NaN                     NaN            P04TDP     Inactive
+10002930-452      452    10002930 20282368 2201-03-23 19:14:33   ADT orders             Admit              New                    NaN                     NaN            P04TDP     Inactive
+
+===== ./hosp/d_labitems.csv =====
+ itemid                      label fluid  category
+  50808               Free Calcium Blood Blood Gas
+  50826               Tidal Volume Blood Blood Gas
+  50813                    Lactate Blood Blood Gas
+  52029          % Ionized Calcium Blood Blood Gas
+  50801 Alveolar-arterial Gradient Blood Blood Gas
+
+===== ./hosp/pharmacy.csv =====
+ subject_id  hadm_id  pharmacy_id  poe_id           starttime  stoptime       medication             proc_type                           status           entertime  verifiedtime  route  frequency  disp_sched  infusion_type  sliding_scale  lockout_interval  basal_rate  one_hr_max  doses_per_24_hrs  duration  duration_interval  expiration_value  expiration_unit  expirationdate  dispensation  fill_quantity
+   10027602 28166872     24340150     NaN 2201-10-30 12:00:00       NaN        Midazolam Miscellaneous Charges Inactive (Due to a change order) 2201-10-30 12:32:11           NaN    NaN        NaN         NaN            NaN            NaN               NaN         NaN         NaN               NaN       NaN                NaN               NaN              NaN             NaN           NaN            NaN
+   10027602 28166872     14435820     NaN 2201-10-30 12:00:00       NaN        Midazolam Miscellaneous Charges Inactive (Due to a change order) 2201-10-30 12:54:34           NaN    NaN        NaN         NaN            NaN            NaN               NaN         NaN         NaN               NaN       NaN                NaN               NaN              NaN             NaN           NaN            NaN
+   10027602 28166872     40720238     NaN 2201-10-30 12:00:00       NaN Fentanyl Citrate Miscellaneous Charges Inactive (Due to a change order) 2201-10-30 12:32:11           NaN    NaN        NaN         NaN            NaN            NaN               NaN         NaN         NaN               NaN       NaN                NaN               NaN              NaN             NaN           NaN            NaN
+   10027602 28166872     27168639     NaN 2201-10-30 12:00:00       NaN Fentanyl Citrate Miscellaneous Charges Inactive (Due to a change order) 2201-10-30 12:54:34           NaN    NaN        NaN         NaN            NaN            NaN               NaN         NaN         NaN               NaN       NaN                NaN               NaN              NaN             NaN           NaN            NaN
+   10027602 28166872     62845687     NaN 2201-10-31 12:00:00       NaN        Lorazepam Miscellaneous Charges Inactive (Due to a change order) 2201-10-31 12:02:42           NaN    NaN        NaN         NaN            NaN            NaN               NaN         NaN         NaN               NaN       NaN                NaN               NaN              NaN             NaN           NaN            NaN
+
+===== ./hosp/diagnoses_icd.csv =====
+ subject_id  hadm_id  seq_num icd_code  icd_version
+   10035185 22580999        3     4139            9
+   10035185 22580999       10     V707            9
+   10035185 22580999        1    41401            9
+   10035185 22580999        9     3899            9
+   10035185 22580999       11    V8532            9
+
+===== ./hosp/transfers.csv =====
+ subject_id  hadm_id  transfer_id eventtype  careunit              intime  outtime
+   10009049 22995465     30030230 discharge       NaN 2174-05-31 14:21:47      NaN
+   10025612 23403708     32533329 discharge       NaN 2125-10-03 12:25:27      NaN
+   10020786 23488445     37922399 discharge       NaN 2189-06-13 17:25:44      NaN
+   10014078 25809882     34694622 discharge       NaN 2166-08-26 14:49:42      NaN
+   10039831 26924951     37155928 discharge       NaN 2116-01-02 14:35:02      NaN
+
+===== ./hosp/emar.csv =====
+ subject_id  hadm_id     emar_id  emar_seq      poe_id  pharmacy_id enter_provider_id           charttime                                                  medication  event_txt        scheduletime           storetime
+   10005909 20199380 10005909-74        74 10005909-97   96110427.0               NaN 2144-10-31 05:56:00                                           Magnesium Sulfate        NaN 2144-10-31 05:56:00 2144-10-31 05:56:00
+   10005909 20199380 10005909-79        79 10005909-97   96110427.0               NaN 2144-10-31 08:00:00                                           Magnesium Sulfate        NaN 2144-10-31 08:00:00 2144-10-31 08:15:00
+   10008287 22168393 10008287-32        32 10008287-58          NaN            P26PKF 2145-09-28 20:15:00 Potassium Chloride Replacement (Critical Care and Oncology)        NaN 2145-09-28 20:15:00 2145-09-28 20:38:00
+   10010471 21322534 10010471-33        33 10010471-51   52131847.0               NaN 2155-05-08 21:45:00                                         Metoprolol Tartrate        NaN 2155-05-08 21:45:00 2155-05-08 22:40:00
+   10015272 27993466 10015272-31        31 10015272-48   88758875.0               NaN 2137-06-13 08:36:00                                         Metoprolol Tartrate        NaN 2137-06-13 08:36:00 2137-06-13 08:36:00
+
+===== ./hosp/labevents.csv =====
+ labevent_id  subject_id  hadm_id  specimen_id  itemid  order_provider_id           charttime           storetime  value  valuenum valueuom  ref_range_lower  ref_range_upper     flag priority  comments
+      172061    10014354 29600294      1808066   51277                NaN 2148-08-16 00:00:00 2148-08-16 01:30:00  15.40     15.40        %             10.5             15.5      NaN  ROUTINE       NaN
+      172062    10014354 29600294      1808066   51279                NaN 2148-08-16 00:00:00 2148-08-16 01:30:00   3.35      3.35     m/uL              4.6              6.1 abnormal  ROUTINE       NaN
+      172068    10014354 29600294      1808066   52172                NaN 2148-08-16 00:00:00 2148-08-16 01:30:00  49.70     49.70       fL             35.1             46.3 abnormal  ROUTINE       NaN
+      172063    10014354 29600294      1808066   51301                NaN 2148-08-16 00:00:00 2148-08-16 01:30:00  20.30     20.30     K/uL              4.0             10.0 abnormal  ROUTINE       NaN
+      172050    10014354 29600294      1808066   51249                NaN 2148-08-16 00:00:00 2148-08-16 01:30:00  31.10     31.10     g/dL             32.0             37.0 abnormal  ROUTINE       NaN
+
+===== ./hosp/d_icd_procedures.csv =====
+ icd_code  icd_version                                             long_title
+       39            9                        Other computer assisted surgery
+       48            9              Insertion of four or more vascular stents
+       74            9             Hip bearing surface, metal-on-polyethylene
+       77            9           Hip bearing surface, ceramic-on-polyethylene
+      126            9 Insertion of catheter(s) into cranial cavity or tissue
+
+===== ./hosp/emar_detail.csv =====
+ subject_id       emar_id  emar_seq  parent_field_ordinal administration_type  pharmacy_id  barcode_type  reason_for_no_barcode  complete_dose_not_given  dose_due dose_due_unit dose_given dose_given_unit  will_remainder_of_dose_be_given  product_amount_given  product_unit  product_code  product_description  product_description_other  prior_infusion_rate  infusion_rate  infusion_rate_adjustment  infusion_rate_adjustment_amount  infusion_rate_unit  route infusion_complete  completion_interval  new_iv_bag_hung  continued_infusion_in_other_location restart_interval  side  site  non_formulary_visual_verification
+   10039708 10039708-1750      1750                   1.1                 NaN   80400800.0           NaN                    NaN                      NaN       NaN           NaN       0.25              mg                              NaN                   NaN           NaN           NaN                  NaN                        NaN                  NaN            NaN                       NaN                              NaN                 NaN    NaN               NaN                  NaN              NaN                                   NaN              NaN   NaN   NaN                                NaN
+   10015860  10015860-565       565                   1.1                 NaN   98178739.0           NaN                    NaN                      NaN       NaN           NaN        ___             NaN                              NaN                   NaN           NaN           NaN                  NaN                        NaN                  NaN            NaN                       NaN                              NaN                 NaN    NaN               NaN                  NaN              NaN                                   NaN              NaN   NaN   NaN                                NaN
+   10005866  10005866-571       571                   1.1                 NaN          NaN           NaN                    NaN                      NaN       NaN           NaN        NaN           mL/hr                              NaN                   NaN           NaN           NaN                  NaN                        NaN                  NaN            NaN                       NaN                              NaN                 NaN    NaN               NaN                  NaN              NaN                                   NaN              NaN   NaN   NaN                                NaN
+   10014354 10014354-2295      2295                   1.1                 NaN    7889909.0           NaN                    NaN                      NaN       NaN           NaN         50             mcg                              NaN                   NaN           NaN           NaN                  NaN                        NaN                  NaN            NaN                       NaN                              NaN                 NaN    NaN               NaN                  NaN              NaN                                   NaN              NaN   NaN   NaN                                NaN
+   10029291  10029291-140       140                   NaN         IV Infusion          NaN           NaN                    NaN                      NaN       NaN    mcg/kg/min        NaN             NaN                              NaN                   NaN           NaN           NaN                  NaN                        NaN                  NaN            NaN                       NaN                              NaN                 NaN    NaN                 N                  NaN              NaN                                   NaN              PRN   NaN   NaN                                NaN
+
+===== ./icu/inputevents.csv =====
+ subject_id  hadm_id  stay_id  caregiver_id           starttime             endtime           storetime  itemid  amount amountuom  rate  rateuom  orderid  linkorderid        ordercategoryname secondaryordercategoryname                                                                        ordercomponenttypedescription ordercategorydescription  patientweight  totalamount totalamountuom  isopenbag  continueinnextdept statusdescription  originalamount  originalrate
+   10005817 20626031 32604416          4793 2132-12-16 19:50:00 2132-12-16 19:51:00 2132-12-16 19:50:00  225798     1.0      dose   NaN      NaN  3316866      3316866      08-Antibiotics (IV)   02-Fluids (Crystalloids)                                                                                 Main order parameter                Drug Push             91          500             ml          0                   0   FinishedRunning               1      1.000000
+   10005817 20626031 32604416         92805 2132-12-15 20:15:00 2132-12-15 20:16:00 2132-12-15 20:11:00  225798     1.0      dose   NaN      NaN  8515923      8515923      08-Antibiotics (IV)   02-Fluids (Crystalloids)                                                                                 Main order parameter                Drug Push             91          500             ml          0                   0   FinishedRunning               1      1.000000
+   10005817 20626031 32604416         20310 2132-12-17 09:15:00 2132-12-17 09:16:00 2132-12-17 09:28:00  225798     1.0      dose   NaN      NaN  8912103      8912103      08-Antibiotics (IV)   02-Fluids (Crystalloids)                                                                                 Main order parameter                Drug Push             91          500             ml          0                   0   FinishedRunning               1      1.000000
+   10005817 20626031 32604416         79166 2132-12-16 09:36:00 2132-12-16 09:37:00 2132-12-16 09:37:00  225798     1.0      dose   NaN      NaN  4059842      4059842      08-Antibiotics (IV)   02-Fluids (Crystalloids)                                                                                 Main order parameter                Drug Push             91          500             ml          0                   0   FinishedRunning               1      1.000000
+   10005817 20626031 32604416         92805 2132-12-15 20:10:00 2132-12-15 21:10:00 2132-12-15 20:10:00  221456     2.0     grams   NaN      NaN  6323189      6323189 02-Fluids (Crystalloids)     Additive (Crystalloid) Additives                                         Ampoule                                                       Continuous IV             91          100             ml          0                   0   FinishedRunning               2      0.033333
+
+===== ./icu/d_items.csv =====
+ itemid                                   label                            abbreviation     linksto category  unitname param_type  lownormalvalue  highnormalvalue
+ 226228                                  Gender                                  Gender chartevents      ADT       NaN       Text             NaN              NaN
+ 226545                                    Race                                    Race chartevents      ADT       NaN       Text             NaN              NaN
+ 229877                     Suction events (CH)                     Suction events (CH) chartevents     ECMO       NaN       Text             NaN              NaN
+ 229875                 Oxygenator visible (CH)                 Oxygenator visible (CH) chartevents     ECMO       NaN       Text             NaN              NaN
+ 229266 Cannula sites visually inspected (ECMO) Cannula sites visually inspected (ECMO) chartevents     ECMO       NaN       Text             NaN              NaN
+
+===== ./icu/datetimeevents.csv =====
+ subject_id  hadm_id  stay_id  caregiver_id           charttime           storetime  itemid               value      valueuom  warning
+   10002428 23473524 35479615         29441 2156-05-15 10:50:00 2156-05-15 10:50:00  225343 2156-05-11 00:00:00          Date        0
+   10002428 23473524 35479615         29441 2156-05-15 10:50:00 2156-05-15 10:50:00  225348 2156-05-11 00:00:00          Date        0
+   10002428 23473524 35479615         29441 2156-05-15 10:50:00 2156-05-15 10:50:00  225345 2156-05-14 09:00:00 Date and Time        0
+   10002428 23473524 35479615         29441 2156-05-15 09:00:00 2156-05-15 10:51:00  224186 2156-05-15 09:00:00 Date and Time        0
+   10002428 23473524 35479615         29441 2156-05-15 09:00:00 2156-05-15 10:51:00  224187 2156-05-15 10:50:00          Date        0
+
+===== ./icu/outputevents.csv =====
+ subject_id  hadm_id  stay_id  caregiver_id           charttime           storetime  itemid  value valueuom
+   10002428 23473524 35479615         29441 2156-05-15 18:00:00 2156-05-15 17:42:00  226583    600       ml
+   10002428 23473524 35479615         29441 2156-05-15 12:00:00 2156-05-15 12:08:00  226559     60       ml
+   10002428 23473524 35479615         29441 2156-05-15 13:00:00 2156-05-15 13:00:00  226559     45       ml
+   10002428 23473524 35479615         29441 2156-05-15 08:00:00 2156-05-15 08:39:00  226559    125       ml
+   10002428 23473524 35479615         29441 2156-05-15 14:00:00 2156-05-15 13:56:00  226559     60       ml
+
+===== ./icu/procedureevents.csv =====
+ subject_id  hadm_id  stay_id  caregiver_id           starttime             endtime               storetime  itemid  value valueuom               location locationcategory  orderid  linkorderid ordercategoryname ordercategorydescription  patientweight  isopenbag  continueinnextdept statusdescription  ORIGINALAMOUNT  ORIGINALRATE
+   10027445 26275841 34499716       10712.0 2142-07-31 01:54:00 2142-08-02 10:44:00     2142-08-02 10:44:00  225792   3410      min                    NaN              NaN   532221       532221       Ventilation        ContinuousProcess            103          1                   0   FinishedRunning            3410             1
+   10027445 26275841 34499716       80518.0 2142-07-31 08:18:00 2142-08-03 15:10:00     2142-08-03 15:23:00  224263   4732      min                    NaN              NaN   401769       401769    Invasive Lines        ContinuousProcess            103          1                   0   FinishedRunning            4732             1
+   10027445 26275841 34499716       96407.0 2142-07-31 06:00:00 2142-08-03 06:03:00     2142-08-03 08:16:00  224275   4323      min      Right Antecubital       Peripheral  9714245      9714245  Peripheral Lines        ContinuousProcess            103          1                   0   FinishedRunning            4323             1
+   10027445 26275841 34499716       96407.0 2142-07-31 02:00:00 2142-08-03 05:57:00     2142-08-03 08:15:00  224275   4557      min Left Basilic Lower Arm       Peripheral  2870557      2870557  Peripheral Lines        ContinuousProcess            103          1                   0   FinishedRunning            4557             1
+   10027445 26275841 34499716           NaN 2142-08-03 08:00:00 2142-08-03 21:06:00 2142-08-03 21:06:00.090  224277    786      min                    NaN              NaN  4920092      4920092  Peripheral Lines        ContinuousProcess            103          1                   0   FinishedRunning             786             1
+
+===== ./icu/chartevents.csv =====
+ subject_id  hadm_id  stay_id  caregiver_id           charttime           storetime  itemid         value  valuenum valueuom  warning
+   10005817 20626031 32604416          6770 2132-12-16 00:00:00 2132-12-15 23:45:00  225054           On        NaN      NaN        0
+   10005817 20626031 32604416          6770 2132-12-16 00:00:00 2132-12-15 23:43:00  223769           100     100.0        %        0
+   10005817 20626031 32604416          6770 2132-12-16 00:00:00 2132-12-15 23:47:00  223956 Atrial demand       NaN      NaN        0
+   10005817 20626031 32604416          6770 2132-12-16 00:00:00 2132-12-15 23:47:00  224866           Yes       NaN      NaN        0
+   10005817 20626031 32604416          6770 2132-12-16 00:00:00 2132-12-15 23:45:00  227341            No       0.0      NaN        0
+
+===== ./icu/icustays.csv =====
+ subject_id  hadm_id  stay_id                                  first_careunit       last_careunit              intime             outtime      los
+   10018328 23786647 31269608                                  Neuro Stepdown      Neuro Stepdown 2154-04-24 23:03:44 2154-05-02 15:55:21 7.702512
+   10020187 24104168 37509585 Neuro Surgical Intensive Care Unit (Neuro SICU)      Neuro Stepdown 2169-01-15 04:56:00 2169-01-20 15:47:50 5.452662
+   10020187 26842957 32554129                              Neuro Intermediate  Neuro Intermediate 2170-02-24 18:18:46 2170-02-25 15:15:26 0.872685
+   10012853 27882036 31338022                             Trauma SICU (TSICU) Trauma SICU (TSICU) 2176-11-26 02:34:49 2176-11-29 20:58:54 3.766725
+   10020740 25826145 32145159                             Trauma SICU (TSICU) Trauma SICU (TSICU) 2150-06-03 20:12:32 2150-06-04 21:05:58 1.037106
+
+===== ./icu/ingredientevents.csv =====
+ subject_id  hadm_id  stay_id  caregiver_id           starttime             endtime           storetime  itemid     amount amountuom       rate rateuom  orderid  linkorderid statusdescription  originalamount  originalrate
+   10005817 20626031 32604416          4793 2132-12-17 05:00:00 2132-12-17 06:00:00 2132-12-17 06:01:00  227074  49.999999        ml  50.000000 mL/hour  7330951      7330951   FinishedRunning               0     50.000000
+   10005817 20626031 32604416          4793 2132-12-17 05:00:00 2132-12-17 06:00:00 2132-12-17 06:01:00  220490  49.999999        ml  50.000000 mL/hour  7330951      7330951   FinishedRunning               0     50.000000
+   10005817 20626031 32604416         20310 2132-12-17 12:00:00 2132-12-17 13:00:00 2132-12-17 12:48:00  220490 249.999990        ml 249.999985 mL/hour  5334154      5334154   FinishedRunning               0    250.000000
+   10005817 20626031 32604416         20310 2132-12-17 12:00:00 2132-12-17 13:00:00 2132-12-17 12:48:00  226509 249.999990        ml 249.999985 mL/hour  5334154      5334154   FinishedRunning               0    250.000000
+   10005817 20626031 32604416         92805 2132-12-15 16:35:00 2132-12-15 18:00:00 2132-12-15 16:42:00  220490  38.852669        ml  27.425413 mL/hour  1386365      3042892   ChangeDose/Rate               0     47.080292
+
+===== ./icu/caregiver.csv =====
+ caregiver_id
+          444
+         1016
+         1135
+         1172
+         1353

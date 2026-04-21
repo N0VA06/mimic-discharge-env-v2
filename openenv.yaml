@@ -1,0 +1,316 @@
+name: mimic-discharge-planning
+version: "3.1.0"
+description: >
+  A production-grade clinical RL environment grounded in real-world ICU patient data
+  from MIMIC-IV. An AI agent acts as a physician managing inpatient care from admission
+  to discharge across four tasks of increasing difficulty.
+  All graders are deterministic — no LLM judge required.
+  v3.0 adds: vitals, fluid balance, eMAR, discharge orders, complexity classification,
+  stochastic masking (noise_level), curriculum modes, 4-step info gating for Task 2.
+  v3.1 adds: Task 4 (10-step sparse-reward workflow), episode history/memory,
+  training rollout collector, GRPO training script, /rollout + /complexity endpoints.
+
+domain: healthcare
+task_type: sequential_decision_making
+data_source: MIMIC-IV Clinical Database Demo v2.2 (PhysioNet)
+
+tasks:
+  - id: 1
+    name: discharge_disposition_prediction
+    difficulty: easy
+    max_steps: 1
+    score_range: [0.0, 1.0]
+    description: >
+      Predict the appropriate discharge disposition for an ICU patient.
+      Choices: home | home_with_services | snf | rehab | hospice | ama | expired | other.
+      Full observation revealed immediately — no information gating.
+    grader: environment.tasks.task1_disposition.DispositionGrader
+    scoring:
+      exact_match: 1.0
+      broad_group_match: 0.5
+      adjacent_group_match: 0.25
+      reasoning_bonus: 0.05
+
+  - id: 2
+    name: care_plan_recommendation
+    difficulty: medium
+    max_steps: 4
+    score_range: [0.0, 1.0]
+    description: >
+      Recommend a comprehensive post-discharge care plan: follow-up specialties,
+      medications to continue or discontinue, and key patient instructions.
+
+      4-step information revelation protocol:
+        Step 0 (reset): demographics, top 5 diagnoses, LOS, complexity tier revealed.
+        Steps 1-3: use information_request to reveal additional data categories.
+        Final submission: provide task2 care plan to receive graded reward.
+
+      Valid information_request values: labs | vitals | medications | microbiology | fluid_balance
+
+      Step efficiency multiplier applied to final reward:
+        ≤2 steps → 1.0×  (optimal: 1 info request + 1 care plan)
+        3 steps  → 0.85×
+        4 steps  → 0.70×
+    grader: environment.tasks.task2_careplan.CarePlanGrader
+    scoring:
+      specialty_f1_weight: 0.35
+      medication_f1_weight: 0.25
+      instruction_quality_weight: 0.25
+      discontinue_accuracy_weight: 0.15
+      hallucination_penalty_max: 0.10
+      ghost_specialty_penalty_max: 0.10
+      step_efficiency_discount:
+        lte_2_steps: 1.00
+        3_steps: 0.85
+        4_steps: 0.70
+
+  - id: 3
+    name: discharge_note_generation
+    difficulty: hard
+    max_steps: 1
+    score_range: [0.0, 1.0]
+    description: >
+      Draft a complete clinical discharge summary note (>=300 words).
+      Evaluated programmatically against MIMIC structured fields.
+      Full observation revealed immediately — no information gating.
+    grader: environment.tasks.task3_note.NoteGrader
+    scoring:
+      diagnosis_coverage_weight: 0.30
+      disposition_accuracy_weight: 0.20
+      medication_f1_weight: 0.20
+      los_accuracy_weight: 0.15
+      structure_score_weight: 0.10
+      information_density_weight: 0.05
+      hallucination_penalty_max: 0.15
+      followup_structure_penalty: 0.05
+
+  - id: 4
+    name: admission_to_discharge_workflow
+    difficulty: very_hard
+    max_steps: 10
+    score_range: [0.0, 1.0]
+    description: >
+      10-step long-horizon workflow simulating full inpatient management.
+      Sparse reward: only Step 10 (final discharge note) returns a non-zero reward
+      for GRPO training. Steps 1-9 record shaping scores used in Step 10's composite.
+      Observation gating: fields are progressively revealed each step.
+      Revision mechanism: agent may revise any prior step (max 2, -0.02 final score each).
+      Filtered to ICU-eligible episodes via curriculum_mode=hard_only recommended.
+    grader: environment.tasks.task4_workflow.Task4Grader
+    steps:
+      1: {focus: acuity_triage,        max_contrib: 0.10}
+      2: {focus: priority_labs_consults, max_contrib: 0.15}
+      3: {focus: interventions,         max_contrib: 0.15}
+      4: {focus: high_risk_medications, max_contrib: 0.10}
+      5: {focus: antibiotic_plan,       max_contrib: 0.10}
+      6: {focus: fluid_strategy,        max_contrib: 0.08}
+      7: {focus: icu_readiness,         max_contrib: 0.08}
+      8: {focus: disposition_los,       max_contrib: 0.10}
+      9: {focus: med_reconciliation,    max_contrib: 0.10}
+      10: {focus: final_note,           formula: "note_score×0.60 + shaping_avg×0.40 + bonuses"}
+    scoring:
+      step10_note_weight: 0.60
+      step10_shaping_weight: 0.40
+      consistency_bonus: 0.10
+      trajectory_bonus: 0.05
+      revision_cost_each: 0.02
+      max_revisions: 2
+
+observation_space:
+  type: object
+  description: Structured patient EHR data + task context
+  note: >
+    For Task 2, fields are gated by the information revelation protocol.
+    Only demographics, top 5 diagnoses, hospital_los_days, and complexity are
+    visible at reset. Other fields appear after information_request.
+  fields:
+    task_id:               {type: integer}
+    subject_id:            {type: integer}
+    hadm_id:               {type: integer}
+    step_num:              {type: integer}
+    max_steps:             {type: integer}
+    age:                   {type: integer}
+    gender:                {type: string}
+    admission_type:        {type: string}
+    admission_location:    {type: string}
+    insurance:             {type: string}
+    language:              {type: string}
+    diagnoses:             {type: array, items: {icd_code, icd_version, description, seq_num}}
+    icu_stays:             {type: array, items: {stay_id, los_days, first_careunit, last_careunit}}
+    medications:           {type: array, items: {drug, route, dose_val_rx}}
+    lab_flags:             {type: array, items: {label, flag, value}}
+    procedures:            {type: array, items: string}
+    drg_codes:             {type: array, items: string}
+    hospital_los_days:     {type: number}
+    microbiology:          {type: array, items: {specimen, organism, resistant_to, sensitive_to}}
+    weight_kg:             {type: number, nullable: true}
+    bmi:                   {type: number, nullable: true}
+    care_trajectory:       {type: array, items: string}
+    icu_procedures:        {type: object}
+    hcpcs_categories:      {type: array, items: string}
+    pharmacy_active:       {type: array, items: string}
+    pharmacy_stopped:      {type: array, items: string}
+    # v3 new fields
+    vitals:
+      type: array
+      task2_gate: "vitals"
+      items: {name, admission_value, discharge_value, min_value, max_value, critical_flag}
+    fluid_balance:
+      type: object
+      nullable: true
+      task2_gate: "fluid_balance"
+      fields: {total_input_ml, total_urine_ml, total_output_ml, net_balance_ml, fluid_overloaded, oliguria}
+    emar_summary:
+      type: array
+      task2_gate: "medications"
+      items: {medication, first_given, last_given, total_doses, active_at_discharge}
+    discharge_orders:
+      type: object
+      nullable: true
+      task2_gate: null  # not accessible via Task 2 information_request
+      fields: {discharge_planning_finalized, documented_discharge_orders}
+    complexity:
+      type: string
+      enum: [easy, medium, hard]
+      note: "always visible — derived from discharge_location, LOS, ICU stay, resistance, oliguria"
+    noise_level:
+      type: string
+      enum: [clean, partial, noisy]
+      note: "reflects the noise_level passed to reset()"
+    episode_history:
+      type: array
+      note: "Task 4 only — prior step summaries for in-context memory"
+      items: {step_num: int, action_summary: string, reward: float}
+    task_description:         {type: string}
+    action_space_description: {type: string}
+
+action_space:
+  type: object
+  fields:
+    task_id: {type: integer, required: true}
+    information_request:
+      type: array
+      optional: true
+      description: >
+        Task 2 only. Request additional data categories before submitting care plan.
+        Valid values: labs | vitals | medications | microbiology | fluid_balance
+      items: string
+    task1:
+      type: object
+      optional: true
+      fields:
+        disposition: "string: home|home_with_services|snf|rehab|hospice|ama|expired|other"
+        reasoning:   "string (optional)"
+    task2:
+      type: object
+      optional: true
+      fields:
+        follow_up_specialties:    "array[string]"
+        medications_to_continue:  "array[string]"
+        medications_to_discontinue: "array[string]"
+        key_instructions:         "array[string]"
+        reasoning:                "string (optional)"
+    task3:
+      type: object
+      optional: true
+      fields:
+        discharge_note: "string (full free-text note, min 300 words)"
+
+reset_parameters:
+  task_id:
+    type: integer
+    default: 1
+    description: "1=disposition, 2=care_plan, 3=discharge_note"
+  hadm_id:
+    type: integer
+    nullable: true
+    default: null
+    description: "Pin a specific hospitalisation for reproducibility. Null = random."
+  noise_level:
+    type: string
+    enum: [clean, partial, noisy]
+    default: clean
+    description: >
+      clean:   no masking — identical output per hadm_id (eval/test default).
+      partial: 30% lab drop, 40% weight/BMI null, truncated meds, 1 care-unit drop.
+      noisy:   partial + shuffled diagnoses, 25% microbiology drop, 2 vitals dropped,
+               20% fluid_balance drop, 15% drug names replaced with formulary codes.
+      For GRPO training: noise_level="partial", for eval: noise_level="clean".
+  curriculum_mode:
+    type: string
+    enum: [random, easy_only, medium_only, hard_only, progressive]
+    default: random
+    description: >
+      random:      sample from all complexity tiers uniformly.
+      easy_only:   home discharge, LOS≤4, no ICU, ≤5 diagnoses.
+      medium_only: intermediate complexity.
+      hard_only:   SNF/rehab/hospice/died, LOS>14, vent>24h, drug resistance, or oliguria.
+      progressive: episodes 0-199 → easy, 200-499 → medium, 500+ → random.
+
+reward:
+  type: float
+  range: [0.0, 1.0]
+  description: >
+    Partial reward signals provided at every step. All graders are fully
+    deterministic and reproducible. No LLM judge required.
+    Task 2 rewards are multiplied by the step efficiency discount before return.
+
+api:
+  base_url: "http://localhost:7860"
+  endpoints:
+    reset:              {method: POST, path: /reset,                    body: "ResetRequest (task_id, hadm_id?, noise_level?, curriculum_mode?)"}
+    step:               {method: POST, path: /step,                    body: "Action"}
+    rollout:            {method: POST, path: /rollout,                 body: "{task_id, actions[], hadm_id?, noise_level?}"}
+    state:              {method: GET,  path: /state}
+    health:             {method: GET,  path: /health}
+    metrics:            {method: GET,  path: /metrics}
+    history:            {method: GET,  path: /history}
+    tasks:              {method: GET,  path: /tasks}
+    episodes:           {method: GET,  path: /episodes}
+    complexity_for_hadm: {method: GET, path: "/complexity/{hadm_id}"}
+    episodes_by_complexity: {method: GET, path: /episodes/by_complexity}
+
+training:
+  rollout_collector: training/rollout_collector.py
+  grpo_script:       training/train_grpo.py
+  framework:         "TRL GRPOTrainer + Unsloth (optional)"
+  base_model:        "Qwen/Qwen2.5-3B-Instruct (recommended)"
+  curriculum_phases:
+    phase_1: {steps: "0-999",    task: 1, noise: clean,   curriculum: easy_only}
+    phase_2: {steps: "1000-2999", task: 2, noise: partial, curriculum: medium_only}
+    phase_3: {steps: "3000+",   task: 3, noise: noisy,   curriculum: random}
+  dead_gradient_guard:
+    metric: task1_zero_reward_rate
+    window: 50
+    threshold: 0.60
+    action: halt_with_warning
+
+runtime:
+  language: python
+  version: "3.11"
+  framework: fastapi
+  entry_point: "server.app:main"
+  port: 7860
+  vcpu_required: 1
+  memory_gb_required: 2
+  inference_timeout_minutes: 20
+
+environment_variables:
+  MIMIC_DATA_PATH:          "Path to MIMIC-IV demo dataset (default: ./mimic-iv-clinical-database-demo-2.2)"
+  HF_TOKEN:                 "HuggingFace token — API key for HF Router (primary LLM)"
+  API_BASE_URL:             "HF Router endpoint (default: https://router.huggingface.co/v1)"
+  MODEL_NAME:               "HF model ID (default: Qwen/Qwen2.5-14B:featherless-ai)"
+  LLM_PRIORITY:             "Provider order (default: hf_router,bedrock)"
+  AWS_ACCESS_KEY_ID:        "AWS key for Bedrock fallback (optional)"
+  AWS_SECRET_ACCESS_KEY:    "AWS secret for Bedrock fallback (optional)"
+  AWS_REGION:               "AWS region (default: us-east-1)"
+  CLAUDE_INFERENCE_PROFILE: "Bedrock model ARN or model ID"
+  ENV_URL:                  "Environment server URL for inference.py (default: http://localhost:7860)"
+  PORT:                     "Server port (default: 7860)"
+
+tags:
+  - openenv
+  - healthcare
+  - clinical-decision-support
+  - mimic-iv
+  - rl-environment
