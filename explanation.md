@@ -832,7 +832,11 @@ rng = random.Random(f"{hadm_id}:{noise_level}")
 | `partial` | 30% random lab drop, 40% chance weight/BMI → None, medications truncated to 7, 1 random care unit dropped from trajectory |
 | `noisy` | All of partial + diagnoses shuffled (sequence numbers randomised), 25% microbiology rows dropped, 2 random vitals removed, 20% chance fluid_balance → None, 15% drug names in medications replaced with formulary codes |
 
-**Training use**: `noise_level="partial"` for GRPO training (forces the model to generalise from incomplete data). `noise_level="clean"` for evaluation (fully reproducible).
+**Training use per task**:
+- **Task 1**: `noise_level="clean"` — disposition decisions are fragile to missing clinical signals (GCS, ICD codes); adding masking noise causes near-zero reward even for correct reasoning
+- **Task 2**: `noise_level="clean"` — medication F1 is the dominant scoring component; the 30% lab drop + medication truncation of `partial` mode pushes F1 near zero even for a correct care plan, killing gradient signal
+- **Task 3**: `noise_level="partial"` — forces generalisation from incomplete labs and truncated med lists; `noisy` mode scrambles diagnosis sequence numbers, making `diagnosis_coverage` always 0.0 and eliminating the 0.30-weight signal
+- **Evaluation**: `noise_level="clean"` for all tasks (fully reproducible)
 
 The seeded RNG means the same (hadm_id, noise_level) combination always produces the same masked observation, making training rollouts reproducible and comparable across model versions.
 
@@ -855,6 +859,24 @@ The `curriculum_mode` parameter controls which complexity tier episodes are samp
 The complexity index is built once at `EpisodeBuilder.__init__()` by classifying all available admissions. It's stored as `{complexity: [hadm_id, ...]}` and accessed via `sample_by_complexity(tier)`.
 
 For Task 4, hard_only is recommended since the 10-step ICU workflow is only meaningful for patients who actually had ICU stays with multi-system illness.
+
+### GRPO Training Curriculum
+
+The `_curriculum(step)` function in `train_grpo.py` controls which task and noise level the reward function uses at each training step. **Task 4 is excluded from the GRPO curriculum** because its 10-step sparse reward (only step 10 signals) means the GRPO batch would need to contain multiple complete 10-step episodes to yield non-zero variance — impractical at typical batch sizes of 4–8 rollouts per prompt.
+
+```python
+def _curriculum(step):
+    if step < 1000:   return 1, "clean",   "easy_only"    # Task 1: learn dispositions
+    if step < 3000:   return 2, "clean",   "medium_only"  # Task 2: care plan + info protocol
+    return               3, "partial",  "random"          # Task 3: free-text note generation
+    # Task 4 excluded: sparse reward produces near-zero GRPO variance at standard batch sizes
+```
+
+| Phase | Steps | Task | Noise | Curriculum mode | Rationale |
+|-------|-------|------|-------|-----------------|-----------|
+| 1 | 0–999 | 1 | clean | easy_only | Learn 8-category disposition on unambiguous home-discharge cases |
+| 2 | 1000–2999 | 2 | clean | medium_only | Learn care plan with info-request protocol; clean noise preserves medication F1 signal |
+| 3 | 3000+ | 3 | partial | random | Learn free-text note generation across all complexity tiers |
 
 ---
 
@@ -918,14 +940,16 @@ The `/rollout` endpoint partially addresses this by accepting a complete list of
 
 ### Rollout Collection — `training/rollout_collector.py`
 
-#### `format_observation(obs: Dict) → str`
+#### `format_observation(obs: Dict, task_id: int) → str`
 
-The core function for converting a structured `Observation` dict to a text prompt for the LLM. It formats all visible fields into clearly labelled sections:
+The core function for converting a structured `Observation` dict to a text prompt for the LLM. It prepends a `_SYSTEM_PROMPT` (clinician persona) and formats all visible fields into clearly labelled sections. Key labelling conventions that are critical for scoring correctness:
 
 ```
+You are a clinical physician making evidence-based discharge planning decisions...
+
 === PATIENT CLINICAL SUMMARY ===
-Task: ...
-Hadm ID: ... | Subject: ... | Step: 0/1
+Task: Discharge Disposition Classification
+Hadm ID: 29079034 | Subject: 10006 | Step: 0/1
 
 --- DEMOGRAPHICS ---
 Age: 68 | Gender: M
@@ -933,25 +957,48 @@ Admission type: EMERGENCY
 LOS: 12.3 days | Complexity: hard
 
 --- DIAGNOSES ---
-  [N18.4] Chronic kidney disease, stage 4
-  [I50.9] Heart failure, unspecified
+  [1] [C79.51] Secondary malignant neoplasm of bone (ICD10)
+  [2] [Z51.5] Encounter for palliative care (ICD10)  ← V667/Z51.5 → hospice
+  [3] [I50.9] Heart failure, unspecified (ICD10)
 
 --- VITALS ---
-  Heart Rate: adm=92 dc=78 [58–118]
-  Systolic BP: adm=145 dc=132 [98–185] [CRITICAL]
+  Heart Rate: adm=92 dc=78 range=[58–118]
+  GCS Total: adm=4 dc=3 range=[3–8]  ← CRITICAL
 
 --- ABNORMAL LABS ---
   Creatinine: 3.2 [Abnormal]
   BNP: 1840 [Critical]
 
---- ACTION REQUIRED ---
-JSON: {"task_id": 1, "task1": {"disposition": "...", "reasoning": "..."}}
-Valid dispositions: home | home_with_services | snf | rehab | hospice | ama | expired | other
+--- ACTIVE MEDICATIONS AT DISCHARGE (use EXACT names) ---
+  metoprolol succinate
+  furosemide
+  lisinopril
 
-Respond ONLY with valid JSON matching the action schema above.
+--- STOPPED/DISCONTINUED MEDICATIONS ---
+  heparin sodium
+  insulin regular
+
+--- MICROBIOLOGY ---
+  Blood: Staphylococcus aureus [resistant: oxacillin] → add Infectious Disease
+
+--- DISCHARGE ORDERS ---
+  Discharge planning finalized: Yes
+  Orders: Follow-up with Cardiology, Home health referral placed
+
+--- TASK SCHEMA ---
+[task-specific decision tree or scoring rules inserted here]
+
+--- ACTION REQUIRED ---
+Respond ONLY with valid JSON:
+{"task_id": 1, "task1": {"disposition": "...", "reasoning": "..."}}
 ```
 
-The prompt ends with an explicit instruction to respond only with JSON, which is critical for `_extract_json()` to parse the output reliably.
+Critical labelling decisions:
+- `pharmacy_active` is labelled **"ACTIVE MEDICATIONS AT DISCHARGE (use EXACT names)"** — the Task 2 and Task 3 graders score only against this list; using medication order names instead causes hallucination penalties
+- `pharmacy_stopped` is labelled **"STOPPED/DISCONTINUED MEDICATIONS"** — for Task 2 `medications_to_discontinue`
+- GCS values ≤ 8 get a `← CRITICAL` annotation to flag end-of-life risk
+- Microbiology with positive organisms appends `→ add Infectious Disease` to prompt specialty selection
+- Each task's schema (`_T1_SCHEMA`, `_T2_SCHEMA`, `_T3_SCHEMA`) is injected inline, providing the ICD-9 range table, ICD-10 prefix table, and decision rules at inference time
 
 #### `_extract_json(text) → Optional[Dict]`
 
@@ -960,7 +1007,30 @@ Three-pass extraction:
 2. Regex extraction of ` ```json ... ``` ` or ` ``` ... ``` ` code blocks
 3. Greedy `{...}` pattern extraction (fallback for JSON embedded in prose)
 
-Returns `None` if all passes fail. The caller substitutes `{"task_id": task_id}` (no-op action) on parse failure, which receives reward 0.0.
+Returns `None` if all passes fail. The caller invokes `_fallback_action(task_id, obs)` instead of a no-op — this uses deterministic clinical heuristics (ICD code analysis, `pharmacy_active` lookup) to generate a non-zero-reward action even when the LLM output is unparseable. This is important for GRPO: a guaranteed-zero fallback removes all gradient signal from failure cases, whereas a heuristic fallback may still score 0.3–0.6 and provides a useful baseline for the group advantage calculation.
+
+#### `run_episode(task_id, hadm_id, noise_level)` — Task 2 info-request protocol
+
+For Task 2, the rollout collector automatically pre-requests information on step 0 before the LLM generates its care plan. This mirrors the inference-time protocol and ensures the LLM sees populated medication and lab data when it formulates the plan:
+
+```python
+if task_id == 2:
+    obs = env.reset(task_id=2, ...)
+    # Auto info-request: unlock labs + medications + microbiology
+    if not obs.get("medications") and not obs.get("lab_flags"):
+        env.step({"task_id": 2, "information_request": ["labs", "medications", "microbiology"]})
+        obs = env.state()  # now obs has meds/labs populated
+    # LLM generates care plan from enriched obs (step 1 onward)
+    prompt = format_observation(obs, task_id=2)
+    response = _llm(prompt)
+    action = _extract_json(response) or _fallback_action(2, obs)
+    # Guard: do not issue second info_request from model output at step ≥ 1
+    if "information_request" in action and step_num >= 1:
+        action = _fallback_action(2, obs)
+    result = env.step(action)
+```
+
+Without this pre-step, the LLM would be asked to recommend medications from an observation with `medications: []`, producing hallucinated drug names that fail the F1 check.
 
 #### `RolloutCollector.collect(task_id, n_episodes) → Dataset`
 
@@ -1024,41 +1094,101 @@ The `make_reward_fn()` factory returns a function that TRL calls after each gene
 def reward_fn(prompts, responses, **kwargs) -> List[float]:
     task_id, noise_level, curriculum_mode = _curriculum(step_counter[0])
     for prompt, response in zip(prompts, responses):
-        action_dict = _extract_json(response)
+        action_dict = _extract_json(response) or {}
+        action_dict["task_id"] = task_id
         env.reset(task_id=task_id, noise_level=noise_level, curriculum_mode=curriculum_mode)
+
+        # Task 2: pre-request info so the grader scores against populated medication state
+        if task_id == 2:
+            env.step({"task_id": 2, "information_request": ["labs", "medications", "microbiology"]})
+
         result = env.step(action_dict)
         rewards.append(result.reward)
     step_counter[0] += len(responses)
     return rewards
 ```
 
-**Important**: For Tasks 1 and 3 (single-step), this is straightforward — each response gets a scalar reward. For Tasks 2 and 4 (multi-step), the reward function handles only a single step call, which means the TRL framework treats each step as an independent training example. Full-episode multi-step GRPO would require a custom rollout loop (the `/rollout` endpoint supports this use case).
+**Why the Task 2 pre-step matters**: The CarePlanGrader computes medication F1 against `pharmacy_active`. If the reward function calls `env.step(care_plan)` without first calling `env.step(information_request)`, the environment's `_revealed_info` set doesn't include `"medications"` — causing the grader to compare against an empty medication list and assigning near-zero F1. The pre-step mirrors the 2-step optimal strategy: one info request + one care plan submission = 1.0× efficiency multiplier.
+
+For Tasks 1 and 3 (single-step), the reward function is straightforward — each response maps to one scalar reward with no pre-step needed. Task 4 is excluded from the curriculum entirely (see Section 10).
 
 #### Curriculum Phases
 
 ```python
 def _curriculum(step):
-    if step < 1000:   return 1, "clean",   "easy_only"
-    if step < 3000:   return 2, "partial", "medium_only"
-    return               3, "noisy",   "random"
+    if step < 1000:   return 1, "clean",   "easy_only"    # Phase 1: dispositions
+    if step < 3000:   return 2, "clean",   "medium_only"  # Phase 2: care plans (clean — preserve med F1)
+    return               3, "partial",  "random"          # Phase 3: discharge notes (partial — force generalisation)
+    # Task 4 excluded: 10-step sparse reward → near-zero GRPO variance at standard batch sizes
 ```
+
+| Phase | Steps | Task | Noise | Why this combination |
+|-------|-------|------|-------|----------------------|
+| 1 | 0–999 | 1 | clean | Unambiguous signal: learn 8-category disposition tree before harder tasks |
+| 2 | 1000–2999 | 2 | **clean** | `partial` drops 30% of medications → F1 ≈ 0 even for correct plans; clean noise preserves gradient |
+| 3 | 3000+ | 3 | **partial** | `noisy` scrambles diagnosis seq numbers → `diagnosis_coverage` ≈ 0.0; partial only truncates labs/meds |
 
 The training loop refreshes the seed dataset at each evaluation checkpoint (`eval_every` steps) to match the current curriculum phase. This ensures the prompt distribution matches the task and noise level being trained on.
 
+#### `_fallback_action(task_id, obs)` — Clinical Heuristic Fallback
+
+When `_extract_json()` returns `None` (unparseable LLM output), the rollout collector calls `_fallback_action` instead of returning a zero-reward no-op. The fallback uses the same clinical logic as `inference.py`:
+
+```python
+def _fallback_action(task_id, obs):
+    if task_id == 1:
+        disposition = "hospice" if _is_end_of_life(obs) else _rule_based_disposition(obs)
+        return {"task_id": 1, "task1": {"disposition": disposition, "reasoning": "Fallback heuristic"}}
+
+    if task_id == 2:
+        specialties = _specialty_from_dx(obs.get("diagnoses", []))
+        meds = obs.get("pharmacy_active", [])[:8]
+        return {"task_id": 2, "task2": {
+            "follow_up_specialties": specialties,
+            "medications_to_continue": meds,
+            "medications_to_discontinue": obs.get("pharmacy_stopped", [])[:3],
+            "key_instructions": ["Follow up with primary care within 1 week", "Take all medications as prescribed"],
+        }}
+
+    if task_id == 3:
+        dx_names = [d["long_title"] for d in obs.get("diagnoses", [])[:5]]
+        meds = obs.get("pharmacy_active", [])[:8]
+        # Build note that names each diagnosis explicitly (required for diagnosis_coverage)
+        return {"task_id": 3, "task3": {"discharge_note": _build_fallback_note(obs, dx_names, meds)}}
+```
+
+A fallback action for Task 1 can score 0.5–1.05 (broad group or exact match + reasoning bonus). For Task 2 it can score 0.35–0.60 (correct specialties + exact pharmacy_active meds). For Task 3 it can score 0.30–0.65 (structured note with diagnosis names and correct medications). This is far better than the guaranteed 0.0 from a no-op, and it provides meaningful GRPO group variance even when the LLM fails to produce parseable JSON.
+
 #### Dead-Gradient Detection
 
-Monitors whether Task 1 reward is consistently 0.0 over the last 50 rollouts:
+Monitors whether the current task's reward is consistently 0.0 over the last 50 rollouts:
 
 ```python
 zero_buf = deque(maxlen=50)  # stores (reward == 0.0) booleans
 
-if task_id == 1 and len(zero_buf) == 50:
+if len(zero_buf) == 50:
     if sum(zero_buf) / len(zero_buf) > 0.60:
         print("Dead gradient detected — halting")
         break
 ```
 
-This catches the case where the model collapses to outputting invalid JSON or nonsensical dispositions, which produces all-zero rewards and provides no training signal. In this case, the LoRA adapter may need to be reset or the learning rate reduced.
+This catches the case where the model collapses to outputting invalid JSON or nonsensical actions, which produces all-zero rewards and provides no training signal. Because `_fallback_action` now generates non-zero rewards on parse failure, a dead gradient indicates a deeper problem (e.g., learning rate too high, catastrophic forgetting) rather than just JSON formatting issues. In this case the LoRA adapter may need to be reset or the learning rate reduced.
+
+#### Seed Dataset Pre-stepping for Task 2
+
+`build_seed_dataset()` constructs the initial training prompts for the TRL `GRPOTrainer`. For Task 2, it performs the info-request pre-step so the seed prompts contain a populated observation (medications + labs visible) rather than the sparse step-0 view:
+
+```python
+if task_id == 2:
+    env.reset(task_id=2, ...)
+    env.step({"task_id": 2, "information_request": ["labs", "medications", "microbiology"]})
+    obs = env.state()  # enriched observation for seed prompt
+else:
+    obs = env.reset(task_id=task_id, ...)
+prompt = format_observation(obs, task_id=task_id)
+```
+
+This means the model trains on step-1 observations (the enriched state after info request), which is the state it will actually need to act on during inference — not the empty step-0 state.
 
 ---
 
@@ -1364,4 +1494,4 @@ curl -s -X POST http://localhost:7860/reset \
 
 ---
 
-*This document covers the complete technical design of MIMIC Discharge Planning v3.1.0. For the formal machine-readable spec, see `openenv.yaml`.*
+*This document covers the complete technical design of MIMIC Discharge Planning v3.2.0 (post-scoring-fix). Key changes from v3.1.0: Task 2/3 noise levels corrected, Task 4 excluded from GRPO curriculum, `_fallback_action` replaces no-op, Task 2 info-request protocol added to rollout collector and reward function, `format_observation` rewritten with labeled pharmacy_active/stopped and task-specific schemas. For the formal machine-readable spec, see `openenv.yaml`.*

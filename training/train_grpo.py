@@ -44,15 +44,17 @@ from datasets import Dataset
 ENV_TIMEOUT = 30
 
 # ─── Curriculum config ────────────────────────────────────────────────────────
+# Task 4 is excluded — its sparse reward (only step 10 signals) and 10-step
+# trajectory add noise without clean gradient signal at this training scale.
 
 def _curriculum(step: int) -> Tuple[int, str, str]:
     """Returns (task_id, noise_level, curriculum_mode) for training step."""
     if step < 1000:
-        return 1, "clean", "easy_only"
+        return 1, "clean",   "easy_only"
     elif step < 3000:
-        return 2, "partial", "medium_only"
+        return 2, "clean",   "medium_only"   # clean (not partial) so meds are populated
     else:
-        return 3, "noisy", "random"
+        return 3, "partial", "random"
 
 
 # ─── Training logger ──────────────────────────────────────────────────────────
@@ -337,11 +339,25 @@ def build_seed_dataset(env_url: str, task_id: int, n: int, noise_level: str, cur
     for _ in range(n):
         try:
             obs = _env_post(env_url, "/reset", {
-                "task_id": task_id,
-                "noise_level": noise_level,
+                "task_id":         task_id,
+                "noise_level":     noise_level,
                 "curriculum_mode": curriculum_mode,
             })
-            rows.append({"prompt": format_observation(obs)})
+            # Task 2: step past the info-request so the seed prompt has full medication/lab data.
+            # The model is trained on step-1 observations (enriched), not step-0 (empty).
+            if task_id == 2:
+                meds_empty = not (obs.get("pharmacy_active") or obs.get("medications"))
+                labs_empty = not obs.get("lab_flags")
+                if meds_empty or labs_empty:
+                    result = _env_post(env_url, "/step", {
+                        "task_id": 2,
+                        "information_request": ["labs", "medications", "microbiology"],
+                    })
+                    enriched = result.get("observation")
+                    if enriched:
+                        obs = enriched
+
+            rows.append({"prompt": format_observation(obs, task_id=task_id)})
         except Exception:
             continue
     return Dataset.from_list(rows) if rows else Dataset.from_list([{"prompt": ""}])
@@ -367,6 +383,7 @@ def make_reward_fn(
 
             if action_dict is None:
                 action_dict = {"task_id": task_id}
+            action_dict["task_id"] = task_id
 
             try:
                 _env_post(env_url, "/reset", {
@@ -374,6 +391,14 @@ def make_reward_fn(
                     "noise_level":     noise_level,
                     "curriculum_mode": curriculum_mode,
                 })
+                # Task 2: unlock lab/medication data before scoring the model's care plan.
+                # Without this, the env has no meds on step 0 and all recommendations
+                # are scored as hallucinations, giving near-zero gradient signal.
+                if task_id == 2:
+                    _env_post(env_url, "/step", {
+                        "task_id": 2,
+                        "information_request": ["labs", "medications", "microbiology"],
+                    })
                 result = _env_post(env_url, "/step", action_dict)
                 reward = float(result.get("reward", 0.0))
             except Exception:

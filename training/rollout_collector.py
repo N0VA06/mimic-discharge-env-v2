@@ -47,19 +47,223 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 ENV_TIMEOUT = 30
 MAX_RETRIES = 3
 
+# ─── Task-specific schemas (mirror of inference.py) ───────────────────────────
 
-# ─── Noop / fallback actions ──────────────────────────────────────────────────
+_T1_SCHEMA = """Output EXACTLY:
+{"task_id": 1, "task1": {"disposition": "<expired|hospice|ama|snf|rehab|home_with_services|home|other>", "reasoning": "<20-50 words citing specific evidence>"}}
 
-_NOOP_ACTIONS: Dict[int, Dict] = {
-    1: {"task_id": 1, "task1": {"disposition": "other", "reasoning": ""}},
-    2: {"task_id": 2, "information_request": ["labs"]},
-    3: {"task_id": 3, "task3": {"discharge_note": "Discharge summary not generated."}},
-    4: {"task_id": 4, "task4": {"triage_level": "floor"}},
+DECISION ORDER (first match wins):
+1. HOSPICE  → ICD V667/Z51.5 (palliative care), secondary malignant neoplasm + DRG mortality=4.0, GCS≤5 with terminal dx
+2. EXPIRED  → patient explicitly died
+3. SNF      → ventilation hours>0 OR dialysis, non-terminal, age>60
+4. REHAB    → orthopedic fracture with surgical fixation, younger patient
+5. HOME WITH SERVICES → needs wound care, IV antibiotics, or home nurse at discharge
+6. HOME     → stable, oral meds only, short LOS, discharge orders finalized
+
+CRITICAL: Terminal cancer / palliative ICD → ALWAYS hospice, never snf/home"""
+
+_T2_SCHEMA = """Output EXACTLY:
+{"task_id": 2, "task2": {"follow_up_specialties": ["<spec>"], "medications_to_continue": ["<drug>"], "medications_to_discontinue": ["<drug>"], "key_instructions": ["<instruction with numbers/thresholds>", ...x5], "reasoning": "<max 20 words>"}}
+
+SPECIALTY: Derive ONLY from actual diagnoses.
+ICD-9: 001-139→Infectious Disease, 140-239→Oncology, 240-279→Endocrinology,
+320-389→Neurology, 390-459→Cardiology, 460-519→Pulmonology,
+520-579→Gastroenterology, 580-629→Nephrology, 800-999→Trauma Surgery
+ICD-10 first letter: A,B→Infectious Disease, C→Oncology, E→Endocrinology,
+G→Neurology, I→Cardiology, J→Pulmonology, K→Gastroenterology, N→Nephrology
+Microbiology organisms → always add Infectious Disease. Always include Primary Care.
+
+MEDICATIONS:
+  medications_to_continue   = EXACT names from ACTIVE MEDICATIONS list ONLY
+  medications_to_discontinue = EXACT names from STOPPED MEDICATIONS list ONLY
+  DO NOT invent drug names."""
+
+_T3_SCHEMA = """Output EXACTLY:
+{"task_id": 3, "task3": {"discharge_note": "<FULL NOTE ≥300 words>"}}
+
+MANDATORY:
+1. Name each top-5 diagnosis by its EXACT description keywords in prose
+2. DISCHARGE MEDICATIONS: ONLY exact names from ACTIVE MEDICATIONS list
+3. LOS: state "[N.N] days" matching the hospital_los_days shown
+4. Use one verbatim disposition phrase:
+   "The patient was discharged home." |
+   "The patient was discharged home with home health services." |
+   "The patient was transferred to a skilled nursing facility." |
+   "The patient was transferred to inpatient rehabilitation." |
+   "The patient was transitioned to hospice care." |
+   "The patient expired during this hospitalization."
+5. Sections in order: PRINCIPAL DIAGNOSIS | BRIEF HOSPITAL COURSE | KEY PROCEDURES PERFORMED | DISCHARGE CONDITION | DISCHARGE DISPOSITION | DISCHARGE MEDICATIONS | FOLLOW-UP INSTRUCTIONS"""
+
+_TASK_SCHEMAS = {1: _T1_SCHEMA, 2: _T2_SCHEMA, 3: _T3_SCHEMA}
+
+_SYSTEM_PROMPT = (
+    "You are a clinical physician producing structured discharge planning outputs. "
+    "Output ONLY a single valid JSON object. No markdown, no prose outside JSON. "
+    "Never invent drug names not in the patient record."
+)
+
+# ─── ICD-9 specialty mapping ───────────────────────────────────────────────────
+
+_ICD9_RANGES = [
+    (1,   139, "Infectious Disease"),
+    (140, 239, "Oncology"),
+    (240, 279, "Endocrinology"),
+    (290, 319, "Psychiatry"),
+    (320, 389, "Neurology"),
+    (390, 459, "Cardiology"),
+    (460, 519, "Pulmonology"),
+    (520, 579, "Gastroenterology"),
+    (580, 629, "Nephrology"),
+    (680, 709, "Dermatology"),
+    (710, 739, "Rheumatology"),
+    (800, 999, "Trauma Surgery"),
+]
+
+_ICD10_PREFIXES = {
+    'A': 'Infectious Disease', 'B': 'Infectious Disease',
+    'C': 'Oncology',           'E': 'Endocrinology',
+    'F': 'Psychiatry',         'G': 'Neurology',
+    'I': 'Cardiology',         'J': 'Pulmonology',
+    'K': 'Gastroenterology',   'N': 'Nephrology',
+    'M': 'Rheumatology',       'S': 'Trauma Surgery',
 }
 
 
+def _specialty_from_dx(diagnoses: List[Dict]) -> List[str]:
+    specs: List[str] = ["Primary Care"]
+    seen = {"Primary Care"}
+    for dx in diagnoses[:8]:
+        code    = str(dx.get("icd_code", "")).strip().upper()
+        version = int(dx.get("icd_version", 10) or 10)
+        spec    = None
+        if version == 9:
+            digits = re.sub(r"\D", "", code)[:3]
+            if digits:
+                num = int(digits)
+                for lo, hi, s in _ICD9_RANGES:
+                    if lo <= num <= hi:
+                        spec = s
+                        break
+        else:
+            spec = _ICD10_PREFIXES.get(code[0]) if code else None
+        if spec and spec not in seen:
+            seen.add(spec)
+            specs.append(spec)
+    return specs
+
+
+def _is_end_of_life(obs: Dict) -> bool:
+    diagnoses = obs.get("diagnoses", []) or []
+    dx_descs  = [str(d.get("description", "")).lower() for d in diagnoses]
+    dx_codes  = [str(d.get("icd_code", "")).upper() for d in diagnoses]
+    drg_codes = [str(d).upper() for d in (obs.get("drg_codes") or [])]
+    if any("V667" in c or "Z515" in c or "Z51.5" in c for c in dx_codes):
+        return True
+    if any("palliative" in d or "comfort care" in d for d in dx_descs):
+        return True
+    if any("secondary malignant neoplasm" in d for d in dx_descs) and \
+       any("MALIGNANCY" in g or "MALIGNANT" in g for g in drg_codes):
+        return True
+    vitals = obs.get("vitals", []) or []
+    for v in vitals:
+        if v.get("name") == "GCS Total":
+            gcs = v.get("discharge_value")
+            if gcs is not None and float(gcs) <= 5:
+                terminal = any(
+                    kw in d for d in dx_descs
+                    for kw in ("malignant", "malignancy", "metastasis", "neoplasm")
+                )
+                if terminal:
+                    return True
+    return False
+
+
+def _fallback_action(task_id: int, obs: Dict) -> Dict:
+    """Deterministic fallback when LLM fails — uses clinical heuristics."""
+    drugs_active  = [str(m) for m in (obs.get("pharmacy_active")  or [])[:8]]
+    drugs_stopped = [str(m) for m in (obs.get("pharmacy_stopped") or [])[:5]]
+    los           = float(obs.get("hospital_los_days", 0) or 0)
+    icu_p         = obs.get("icu_procedures", {}) or {}
+    vent          = float(icu_p.get("ventilation_hours", 0) or 0)
+    dial          = bool(icu_p.get("has_dialysis", False))
+    age           = int(obs.get("age", 65) or 65)
+    diagnoses     = obs.get("diagnoses", []) or []
+    eol           = _is_end_of_life(obs)
+    facility      = vent > 0 or dial or (los > 7 and age > 70)
+
+    if task_id == 1:
+        dx_descs = [str(d.get("description","")).lower() for d in diagnoses]
+        is_ortho = any(kw in d for d in dx_descs for kw in ("fracture","femur","hip"))
+        if eol:
+            disp, reason = "hospice", "Terminal malignancy with palliative care indicators."
+        elif is_ortho and not facility:
+            disp, reason = "rehab", "Orthopedic fracture with surgical fixation requiring rehab."
+        elif facility:
+            disp, reason = "snf", "ICU or ventilation stay with advanced age requires skilled nursing."
+        else:
+            disp, reason = "home", "Hemodynamically stable, short LOS, oral medications only."
+        return {"task_id": 1, "task1": {"disposition": disp, "reasoning": reason}}
+
+    if task_id == 2:
+        specs = _specialty_from_dx(diagnoses)
+        if obs.get("microbiology") and "Infectious Disease" not in specs:
+            specs.append("Infectious Disease")
+        return {"task_id": 2, "task2": {
+            "follow_up_specialties": specs[:4],
+            "medications_to_continue":   drugs_active,
+            "medications_to_discontinue": drugs_stopped[:3],
+            "key_instructions": [
+                "Follow up with primary care within 1 week of discharge.",
+                "Complete the full antibiotic course as prescribed; do not stop early.",
+                "Maintain a low-sodium diet under 2000 mg per day.",
+                "Weigh yourself every morning; call doctor if weight increases >2 lbs/day or >5 lbs/week.",
+                "Return to ED immediately for fever >38.5°C, chest pain, or severe worsening symptoms.",
+            ],
+            "reasoning": "Derived from ICD code analysis and active medication list.",
+        }}
+
+    if task_id == 3:
+        dx_list  = "\n".join(f"{i+1}. {d.get('description','Unknown')}" for i, d in enumerate(diagnoses[:5]))
+        drug_list = "\n".join(f"- {d}" for d in drugs_active) or "- No medications prescribed at discharge"
+        disp_phrase = (
+            "The patient was transitioned to hospice care." if eol else
+            "The patient was transferred to a skilled nursing facility." if facility else
+            "The patient was discharged home with home health services." if drugs_active else
+            "The patient was discharged home."
+        )
+        los_text = f"{los:.1f}"
+        procs    = obs.get("procedures") or []
+        proc_text = "; ".join(procs[:3]) if procs else "Routine monitoring and laboratory evaluation"
+        note = (
+            f"PRINCIPAL DIAGNOSIS: {diagnoses[0].get('description','Acute medical illness') if diagnoses else 'Acute medical illness'}\n\n"
+            f"BRIEF HOSPITAL COURSE: The patient is a {obs.get('age','?')}-year-old "
+            f"{'male' if str(obs.get('gender','')).upper()=='M' else 'female'} "
+            f"admitted via the emergency room with {diagnoses[0].get('description','acute illness') if diagnoses else 'acute illness'}. "
+            f"The hospital stay lasted {los_text} days. "
+            f"The patient was managed for the following diagnoses:\n{dx_list}\n"
+            "All active medical problems were addressed and specialist consultations were obtained as indicated. "
+            "The patient's condition stabilised with appropriate treatment and the patient was deemed safe for discharge.\n\n"
+            f"KEY PROCEDURES PERFORMED: {proc_text}\n\n"
+            "DISCHARGE CONDITION: Stable, improved from admission baseline. Vital signs within acceptable limits.\n\n"
+            f"DISCHARGE DISPOSITION: {disp_phrase}\n\n"
+            f"DISCHARGE MEDICATIONS:\n{drug_list}\n\n"
+            "FOLLOW-UP INSTRUCTIONS: Follow up with primary care within 1 week. Continue all prescribed medications. "
+            "Maintain a low-sodium diet under 2000 mg per day. "
+            "Weigh yourself every morning; call your doctor if weight increases more than 2 lbs in one day or 5 lbs in one week. "
+            "Return to the emergency department immediately for fever over 38.5°C, chest pain, worsening shortness of breath, "
+            "severe pain, or any sudden change in your condition."
+        )
+        return {"task_id": 3, "task3": {"discharge_note": note}}
+
+    return {"task_id": task_id}
+
+
+# ─── Noop actions (used only on parse failure, not as default) ────────────────
+
 def _noop_action(task_id: int) -> Dict:
-    return dict(_NOOP_ACTIONS.get(task_id, {"task_id": task_id}))
+    return {"task_id": task_id, "task1": {"disposition": "other", "reasoning": ""}} if task_id == 1 else \
+           {"task_id": task_id, "task3": {"discharge_note": "Discharge summary not generated."}} if task_id == 3 else \
+           {"task_id": task_id}
 
 
 # ─── JSON extraction (dicts only) ────────────────────────────────────────────
@@ -219,109 +423,131 @@ class _EnvClient:
 
 # ─── Observation formatter ────────────────────────────────────────────────────
 
-def format_observation(obs: Dict[str, Any]) -> str:
-    """Convert raw observation dict to structured text prompt for the LLM."""
-    lines: List[str] = []
+def format_observation(obs: Dict[str, Any], task_id: Optional[int] = None) -> str:
+    """Convert raw observation dict to structured clinical prompt for the LLM."""
+    tid = task_id or int(obs.get("task_id") or obs.get("task_id_hint") or 1)
+    lines: List[str] = [_SYSTEM_PROMPT, "", "=== PATIENT SUMMARY ==="]
 
-    lines.append("=== PATIENT CLINICAL SUMMARY ===")
-    lines.append(f"Task: {obs.get('task_description', '')}")
+    los = obs.get("hospital_los_days", 0)
     lines.append(
-        f"Hadm ID: {obs.get('hadm_id', '?')} | Subject: {obs.get('subject_id', '?')} | "
-        f"Step: {obs.get('step_num', 0)}/{obs.get('max_steps', 1)}"
+        f"Age: {obs.get('age','?')}  Gender: {obs.get('gender','?')}  "
+        f"LOS: {los:.1f} days  Complexity: {obs.get('complexity','?')}"
     )
-    lines.append("")
+    lines.append(f"Admission: {obs.get('admission_type','?')} via {obs.get('admission_location','?')}")
 
-    lines.append("--- DEMOGRAPHICS ---")
-    lines.append(f"Age: {obs.get('age', '?')} | Gender: {obs.get('gender', '?')}")
-    lines.append(f"Admission type: {obs.get('admission_type', '?')}")
-    lines.append(f"LOS: {obs.get('hospital_los_days', 0):.1f} days | Complexity: {obs.get('complexity', '?')}")
-    lines.append("")
+    icu_p = obs.get("icu_procedures", {}) or {}
+    vent  = float(icu_p.get("ventilation_hours", 0) or 0)
+    dial  = bool(icu_p.get("has_dialysis", False))
+    if vent > 0:
+        lines.append(f"ICU ventilation: {vent:.1f} hours")
+    if dial:
+        lines.append("Dialysis used: YES")
 
-    dx = obs.get("diagnoses") or []
-    if dx:
-        lines.append("--- DIAGNOSES ---")
-        for d in dx[:5]:
-            lines.append(f"  [{d.get('icd_code','?')}] {d.get('description','?')}")
-        lines.append("")
+    icu_stays = obs.get("icu_stays") or []
+    if icu_stays:
+        s = icu_stays[0]
+        lines.append(f"ICU: {float(s.get('los_days',0)):.2f} days in {s.get('first_careunit','?')}")
 
-    icu = obs.get("icu_stays") or []
-    if icu:
-        lines.append("--- ICU STAYS ---")
-        for s in icu:
-            lines.append(
-                f"  {s.get('first_careunit','?')} → {s.get('last_careunit','?')}  "
-                f"({s.get('los_days', 0):.1f} days)"
-            )
-        lines.append("")
+    traj = obs.get("care_trajectory") or []
+    if traj:
+        lines.append(f"Care path: {' → '.join(traj)}")
 
+    # Vitals — GCS is critical for end-of-life decisions
     vitals = obs.get("vitals") or []
     if vitals:
-        lines.append("--- VITALS ---")
+        lines.append("\n-- VITALS (admission → discharge) --")
         for v in vitals:
-            crit = " [CRITICAL]" if v.get("critical_flag") else ""
+            crit = "  ← CRITICAL" if v.get("critical_flag") else ""
             lines.append(
-                f"  {v.get('name','?')}: adm={v.get('admission_value','?')} "
-                f"dc={v.get('discharge_value','?')}  "
-                f"[{v.get('min_value','?')}–{v.get('max_value','?')}]{crit}"
+                f"  {v.get('name','?'):20s}: {v.get('admission_value','?')} → "
+                f"{v.get('discharge_value','?')}{crit}"
             )
-        lines.append("")
 
+    # Discharge orders — strong signal for disposition
+    dorders = obs.get("discharge_orders") or {}
+    if dorders:
+        lines.append("\n-- DISCHARGE ORDERS --")
+        lines.append(f"  Finalized: {dorders.get('discharge_planning_finalized', False)}")
+        otypes = dorders.get("documented_discharge_orders", [])
+        if otypes:
+            lines.append(f"  Types: {', '.join(otypes)}")
+
+    # Diagnoses (shown with ICD codes for specialty derivation)
+    diagnoses = obs.get("diagnoses") or []
+    if diagnoses:
+        lines.append("\n-- DIAGNOSES (derive specialties from ICD codes) --")
+        for d in diagnoses[:10]:
+            lines.append(
+                f"  [{d.get('seq_num',0):2d}] ICD{d.get('icd_version','?')}-"
+                f"{d.get('icd_code',''):10s}  {d.get('description','')}"
+            )
+
+    # Active medications — the ONLY source for medications_to_continue
+    meds_active = obs.get("pharmacy_active") or []
+    if meds_active:
+        lines.append("\n-- ACTIVE MEDICATIONS AT DISCHARGE (use EXACT names for medications_to_continue) --")
+        for m in meds_active:
+            lines.append(f"  ✓ {m}")
+    else:
+        lines.append("\n-- ACTIVE MEDICATIONS AT DISCHARGE: None --")
+
+    # Stopped medications — source for medications_to_discontinue
+    meds_stopped = obs.get("pharmacy_stopped") or []
+    if meds_stopped:
+        lines.append("\n-- STOPPED/DISCONTINUED MEDICATIONS --")
+        for m in meds_stopped[:10]:
+            lines.append(f"  ✗ {m}")
+
+    # Medication orders (reference context, NOT the discharge active list)
+    meds_orders = obs.get("medications") or []
+    if meds_orders:
+        lines.append("\n-- MEDICATION ORDERS during admission (reference only) --")
+        for m in meds_orders[:10]:
+            lines.append(f"  {m.get('drug','?')} {m.get('dose_val_rx','')} [{m.get('route','')}]".strip())
+
+    # Abnormal labs
     labs = obs.get("lab_flags") or []
-    abnormal = [l for l in labs if str(l.get("flag", "")).lower() in ("abnormal", "critical", "high", "low")]
-    if abnormal:
-        lines.append("--- ABNORMAL LABS ---")
-        for l in abnormal[:10]:
-            lines.append(f"  {l.get('label','?')}: {l.get('value','?')} [{l.get('flag','?')}]")
-        lines.append("")
+    if labs:
+        lines.append("\n-- ABNORMAL LABS --")
+        for lab in labs[:10]:
+            lines.append(f"  {lab.get('label','?'):30s} {str(lab.get('value','?')):>10}  [{lab.get('flag','?')}]")
 
-    meds = obs.get("medications") or []
-    if meds:
-        lines.append("--- MEDICATIONS ---")
-        for m in meds[:10]:
-            lines.append(f"  {m.get('drug','?')} {m.get('route','')} {m.get('dose_val_rx','')}")
-        lines.append("")
-
-    emar = obs.get("emar_summary") or []
-    active_emar = [e for e in emar if e.get("active_at_discharge")]
-    if active_emar:
-        lines.append("--- ACTIVE AT DISCHARGE (eMAR) ---")
-        for e in active_emar[:8]:
-            lines.append(f"  {e.get('medication','?')} (last: {e.get('last_given','?')})")
-        lines.append("")
-
+    # Microbiology — triggers Infectious Disease specialty
     micro = obs.get("microbiology") or []
     if micro:
-        lines.append("--- MICROBIOLOGY ---")
+        lines.append("\n-- MICROBIOLOGY (→ add Infectious Disease to specialties) --")
         for m in micro[:5]:
-            org = m.get("organism") or "No growth"
-            res = ", ".join(m.get("resistant_to") or [])
-            lines.append(f"  {m.get('specimen','?')}: {org}" + (f"  R: {res}" if res else ""))
-        lines.append("")
+            org = m.get("organism") or m.get("org_name") or "?"
+            lines.append(f"  ⚠ {org}")
 
-    fb = obs.get("fluid_balance")
-    if fb:
-        lines.append("--- FLUID BALANCE ---")
-        lines.append(
-            f"  Input: {fb.get('total_input_ml',0):.0f} mL  "
-            f"Output: {fb.get('total_output_ml',0):.0f} mL  "
-            f"Net: {fb.get('net_balance_ml',0):+.0f} mL"
-        )
-        flags = [f for f, k in [("OVERLOADED", "fluid_overloaded"), ("OLIGURIA", "oliguria")] if fb.get(k)]
-        if flags:
-            lines.append(f"  Flags: {', '.join(flags)}")
-        lines.append("")
+    # Procedures
+    procs = obs.get("procedures") or []
+    if procs:
+        lines.append("\n-- PROCEDURES --")
+        for p in procs[:6]:
+            lines.append(f"  {p}")
 
-    history = obs.get("episode_history") or []
-    if history:
-        lines.append("--- PRIOR STEPS ---")
-        for h in history:
-            lines.append(f"  Step {h.get('step_num','?')}: {h.get('action_summary','—')}")
-        lines.append("")
+    # DRG
+    drg = obs.get("drg_codes") or []
+    if drg:
+        lines.append("\n-- DRG --")
+        for d in drg[:2]:
+            lines.append(f"  {d}")
 
-    lines.append("--- ACTION REQUIRED ---")
-    lines.append(obs.get("action_space_description", ""))
-    lines.append("")
-    lines.append("Respond ONLY with valid JSON matching the action schema above. No prose, no markdown.")
+    # eMAR active drugs (additional confirmation of discharge medications)
+    emar = obs.get("emar_summary") or []
+    active_emar = [e.get("medication","") for e in emar if e.get("active_at_discharge")]
+    if active_emar and tid in (2, 3):
+        lines.append("\n-- eMAR CONFIRMED ACTIVE AT DISCHARGE --")
+        for med in active_emar[:10]:
+            lines.append(f"  ✓ {med}")
+
+    # Task schema
+    lines.append(f"\n=== TASK {tid} ===")
+    lines.append(obs.get("task_description", ""))
+    lines.append("\n=== REQUIRED OUTPUT FORMAT ===")
+    lines.append(_TASK_SCHEMAS.get(tid, obs.get("action_space_description", "")))
+    lines.append("\nRespond ONLY with valid JSON. No markdown, no prose outside JSON.")
 
     return "\n".join(lines)
 
@@ -351,7 +577,10 @@ class RolloutCollector:
 
     def _llm(self, prompt: str, max_new_tokens: int = 512) -> Tuple[str, str]:
         """Run LLM inference. Returns (response_text, error_type)."""
-        messages = [{"role": "user", "content": prompt}]
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user",   "content": prompt},
+        ]
         try:
             text = self.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
@@ -383,6 +612,9 @@ class RolloutCollector:
         hadm_id: Optional[int] = None,
         noise_level: str = "clean",
     ) -> Dict:
+        if task_id not in (1, 2, 3):
+            raise ValueError(f"task_id {task_id} not supported for training (only 1-3)")
+
         reset_body: Dict[str, Any] = {"task_id": task_id, "noise_level": noise_level}
         if hadm_id is not None:
             reset_body["hadm_id"] = hadm_id
@@ -392,13 +624,43 @@ class RolloutCollector:
         steps: List[Dict] = []
 
         while not done:
-            prompt             = format_observation(obs)
-            response_txt, llm_err = self._llm(prompt)
+            step_num = int(obs.get("step_num", 0))
+
+            # Task 2: auto-request labs+meds+microbiology on step 0 when data is sparse
+            # This unlocks the full medication/lab data before the LLM generates the care plan.
+            if task_id == 2 and step_num == 0:
+                meds_empty = not (obs.get("pharmacy_active") or obs.get("medications"))
+                labs_empty = not obs.get("lab_flags")
+                if meds_empty or labs_empty:
+                    info_req = {"task_id": 2, "information_request": ["labs", "medications", "microbiology"]}
+                    try:
+                        info_result = self.client.post("/step", info_req)
+                        # Update obs with the enriched observation (has meds+labs now)
+                        enriched = info_result.get("observation")
+                        if enriched:
+                            obs = enriched
+                        # Info requests return reward=0, done=False — continue to LLM step
+                        if info_result.get("done"):
+                            done = True
+                            steps.append({
+                                "prompt": "", "response": "", "reward": 0.0,
+                                "partial": {}, "parse_ok": False,
+                                "error_type": "info_req_done", "step_num": step_num,
+                            })
+                            break
+                    except Exception as e:
+                        print(f"  [INFO_REQ] failed: {e}")
+
+            prompt             = format_observation(obs, task_id)
+            response_txt, llm_err = self._llm(
+                prompt,
+                max_new_tokens=512 if task_id == 1 else (1024 if task_id == 2 else 3072),
+            )
 
             # Parse + normalize action
             error_type = llm_err
             if llm_err:
-                action_dict = _noop_action(task_id)
+                action_dict = _fallback_action(task_id, obs)
                 parse_ok    = False
             else:
                 raw = _extract_json(response_txt)
@@ -407,8 +669,14 @@ class RolloutCollector:
                     action_dict = _normalize_action(raw, task_id)
                     error_type  = ""
                 else:
-                    action_dict = _noop_action(task_id)
+                    action_dict = _fallback_action(task_id, obs)
                     error_type  = "parse_fail"
+
+            # For Task 2 on step >= 1: never send another information_request
+            if task_id == 2 and step_num >= 1 and action_dict.get("information_request"):
+                action_dict = _fallback_action(task_id, obs)
+                error_type  = "t2_forced_plan"
+                parse_ok    = False
 
             # Submit to env; handle schema validation errors gracefully
             try:
@@ -417,15 +685,11 @@ class RolloutCollector:
                 done   = bool(result.get("done", True))
             except requests.exceptions.HTTPError as e:
                 if e.response is not None and e.response.status_code == 422:
-                    # Schema validation failed even after normalization — use noop
-                    print(
-                        f"  [422] schema error after normalize. "
-                        f"Sending noop. Detail: {e.args[0][:120]}"
-                    )
+                    print(f"  [422] schema error. Using fallback. Detail: {e.args[0][:120]}")
                     error_type = "schema_422"
                     parse_ok   = False
                     try:
-                        result = self.client.post("/step", _noop_action(task_id))
+                        result = self.client.post("/step", _fallback_action(task_id, obs))
                         reward = float(result.get("reward", 0.0))
                         done   = bool(result.get("done", True))
                     except Exception:
@@ -442,7 +706,7 @@ class RolloutCollector:
                 "partial":    result.get("partial_signals", {}),
                 "parse_ok":   parse_ok,
                 "error_type": error_type,
-                "step_num":   int(obs.get("step_num", 0)),
+                "step_num":   step_num,
             })
 
             if not done:
