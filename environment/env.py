@@ -3,7 +3,7 @@ import logging
 import random
 from typing import Optional, Dict, Any, Set
 
-from .old_episode_builder import EpisodeBuilder
+from .episode_builder import EpisodeBuilder
 from .models import (
     Action, Observation, StepResult, StateInfo, ResetRequest,
     DiagnosisInfo, ICUStay, LabFlag, Medication,

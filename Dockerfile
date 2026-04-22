@@ -25,7 +25,7 @@ ENV PATH="/home/user/.local/bin:$PATH"
 WORKDIR /app
 
 # Install Python dependencies first (layer-cached unless requirements change)
-COPY --chown=user requirements.txt .
+COPY --chown=user requirements.txt pyproject.toml ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Application source
@@ -34,11 +34,18 @@ COPY --chown=user server/ server/
 COPY --chown=user inference.py .
 COPY --chown=user openenv.yaml .
 
+# Install the local package so `server` and `environment` are in site-packages.
+# --no-deps avoids reinstalling everything from requirements.txt.
+RUN pip install --no-cache-dir --no-deps .
+
 # Demo dataset — bundled so the Space works without external downloads
 COPY --chown=user mimic-iv-clinical-database-demo-2.2/ mimic-iv-clinical-database-demo-2.2/
 
 ENV PORT=7860
 ENV MIMIC_DATA_PATH=/app/mimic-iv-clinical-database-demo-2.2
+# Belt-and-suspenders: ensures /app is always on sys.path regardless of
+# how the interpreter is invoked (e.g. uvicorn worker subprocesses).
+ENV PYTHONPATH=/app
 
 EXPOSE 7860
 

@@ -368,9 +368,16 @@ def build_seed_dataset(env_url: str, task_id: int, n: int, noise_level: str, cur
 def make_reward_fn(
     env_url: str,
     step_counter: List[int],
-    zero_buf: Deque[bool],
+    zero_bufs: Dict[int, Deque[bool]],
     logger: Optional[TrainingLogger] = None,
+    sample_every: int = 50,
 ) -> Any:
+    """
+    Returns the GRPO reward function.
+
+    zero_bufs: per-task deques (keys 1, 2, 3) for zero-reward monitoring.
+    sample_every: print a sample generation to stdout every N steps.
+    """
     def reward_fn(prompts: List[str], responses: List[str], **kwargs) -> List[float]:
         task_id, noise_level, curriculum_mode = _curriculum(step_counter[0])
         rewards:   List[float] = []
@@ -405,8 +412,8 @@ def make_reward_fn(
                 reward = 0.0
 
             rewards.append(reward)
-            if task_id == 1:
-                zero_buf.append(reward == 0.0)
+            if task_id in zero_bufs:
+                zero_bufs[task_id].append(reward == 0.0)
 
         step_counter[0] += len(rewards)
 
@@ -419,6 +426,30 @@ def make_reward_fn(
                 rewards=rewards,
                 parse_ok=parse_ok,
             )
+
+        # ── Live console log ──────────────────────────────────────────────────
+        mean_r     = sum(rewards) / len(rewards) if rewards else 0.0
+        parse_rate = sum(parse_ok) / len(parse_ok) if parse_ok else 0.0
+        zero_rate  = sum(r == 0.0 for r in rewards) / len(rewards) if rewards else 1.0
+        reward_strs = " ".join(f"{r:.3f}" for r in rewards)
+        print(
+            f"[step {step_counter[0]:5d} | task {task_id} | {curriculum_mode:12s}] "
+            f"reward: mean={mean_r:.3f}  [{reward_strs}]  "
+            f"parse={parse_rate:.0%}  zeros={zero_rate:.0%}"
+        )
+
+        # Zero-rate log for all monitored tasks
+        for tid, buf in zero_bufs.items():
+            if len(buf) >= 10:
+                rate = sum(buf) / len(buf)
+                if rate > 0.40:
+                    print(f"  [WARN] Task {tid} zero-reward rate = {rate:.0%} "
+                          f"over last {len(buf)} rollouts")
+
+        # Periodic sample generation (shows what the model is actually producing)
+        if responses and (step_counter[0] % sample_every) < len(rewards):
+            preview = responses[0].replace("\n", " ")[:300]
+            print(f"  [sample reward={rewards[0]:.4f}] {preview}")
 
         return rewards
 
@@ -444,10 +475,17 @@ def train(
 
     logger = TrainingLogger(log_dir)
     step_counter: List[int] = [0]
-    zero_buf: Deque[bool]   = deque(maxlen=50)
-    reward_fn = make_reward_fn(env_url, step_counter, zero_buf, logger)
+    zero_bufs: Dict[int, Deque[bool]] = {
+        1: deque(maxlen=50),
+        2: deque(maxlen=50),
+        3: deque(maxlen=50),
+    }
+    reward_fn = make_reward_fn(env_url, step_counter, zero_bufs, logger)
 
     task_id, noise_level, curr_mode = _curriculum(0)
+    print(f"\n{'='*60}")
+    print(f"Phase 1 start  — task={task_id}  noise={noise_level}  curriculum={curr_mode}")
+    print(f"{'='*60}")
     seed_dataset = build_seed_dataset(env_url, task_id, seed_n, noise_level, curr_mode)
     print(f"Seed dataset: {len(seed_dataset)} prompts")
 
@@ -475,11 +513,21 @@ def train(
     print("Starting GRPO training…")
     t0    = time.time()
     chunk = 0
+    prev_task_id = task_id
 
     while step_counter[0] < max_steps:
         task_id, noise_level, curr_mode = _curriculum(step_counter[0])
+
+        # Print phase transition banner when task changes
+        if task_id != prev_task_id:
+            phase = {1: 1, 2: 2, 3: 3}.get(task_id, "?")
+            print(f"\n{'='*60}")
+            print(f"Phase {phase} start  — task={task_id}  noise={noise_level}  curriculum={curr_mode}  step={step_counter[0]}")
+            print(f"{'='*60}")
+            prev_task_id = task_id
+
         print(
-            f"\n[Chunk {chunk}  step~{step_counter[0]}]  "
+            f"\n[Chunk {chunk}  step={step_counter[0]}]  "
             f"task={task_id}  noise={noise_level}  curriculum={curr_mode}"
         )
 
@@ -488,22 +536,34 @@ def train(
         )
         trainer.train(resume_from_checkpoint=(chunk > 0))
 
-        # Dead-gradient detection (Task 1 only)
-        if task_id == 1 and len(zero_buf) == 50:
-            zero_rate = sum(zero_buf) / len(zero_buf)
-            if zero_rate > 0.60:
+        # Dead-gradient detection (Task 1 halt; Tasks 2/3 warn only)
+        for tid, buf in zero_bufs.items():
+            if len(buf) < 50:
+                continue
+            zero_rate = sum(buf) / len(buf)
+            if tid == task_id == 1 and zero_rate > 0.60:
                 print(
-                    f"[WARNING] Dead gradient: {zero_rate:.1%} zero-reward rate on Task 1 "
+                    f"\n[WARNING] Dead gradient: {zero_rate:.1%} zero-reward rate on Task 1 "
                     f"over last 50 rollouts. Halting."
                 )
                 break
-
-        # Checkpoint visualization
-        logger.plot(log_dir)
-
-        chunk += 1
-        elapsed_min = round((time.time() - t0) / 60, 1)
-        print(f"  Elapsed: {elapsed_min} min")
+            if zero_rate > 0.80:
+                print(
+                    f"[WARNING] Task {tid} zero-reward rate = {zero_rate:.1%} over last 50 rollouts."
+                )
+        else:
+            # Checkpoint visualization (only when we didn't break out)
+            logger.plot(log_dir)
+            chunk += 1
+            elapsed_min = round((time.time() - t0) / 60, 1)
+            # Per-task zero-rate summary
+            rate_summary = "  ".join(
+                f"T{tid}={sum(buf)/len(buf):.0%}" if buf else f"T{tid}=n/a"
+                for tid, buf in zero_bufs.items()
+            )
+            print(f"  Chunk done. Elapsed={elapsed_min}min  zero-rates: {rate_summary}")
+            continue
+        break  # dead gradient on Task 1
 
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)

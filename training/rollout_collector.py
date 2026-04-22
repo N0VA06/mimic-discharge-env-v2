@@ -699,6 +699,13 @@ class RolloutCollector:
                 else:
                     raise
 
+            # When the LLM failed to produce a valid action the env was stepped with
+            # a heuristic fallback to keep the episode moving.  That fallback's reward
+            # belongs to the heuristic, not to the LLM's output — zero it so the
+            # dataset never contains (garbled_text → 0.3-0.6 reward) pairs.
+            if not parse_ok:
+                reward = 0.0
+
             steps.append({
                 "prompt":     prompt,
                 "response":   response_txt,
