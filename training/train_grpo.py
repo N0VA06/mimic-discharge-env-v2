@@ -981,6 +981,21 @@ def build_seed_dataset(
 
 # ── Reward function ───────────────────────────────────────────────────────────
 
+def _comp_text(c: Any) -> str:
+    """Extract plain text from a completion that may be a string or a TRL
+    message-list (list of dicts with role/content keys).  TRL >= 0.12 passes
+    message-list completions when prompts are in conversational format."""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        for msg in c:
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                return str(msg.get("content", ""))
+        # fallback: join all content fields
+        return " ".join(str(msg.get("content", "")) for msg in c if isinstance(msg, dict))
+    return str(c)
+
+
 def make_reward_fn(
     env_url:       str,
     step_counter:  List[int],
@@ -996,8 +1011,8 @@ def make_reward_fn(
     from training.rollout_collector import _normalize_action as _norm_action
 
     def reward_fn(
-        prompts:     List[str],
-        completions: List[str],
+        prompts:     List[Any],
+        completions: List[Any],
         **kwargs,
     ) -> List[float]:
 
@@ -1006,28 +1021,38 @@ def make_reward_fn(
         rewards:  List[float] = []
         parse_ok: List[bool]  = []
 
+        # Normalise completions to plain strings (TRL passes message-list dicts
+        # when prompts are in conversational format).
+        texts = [_comp_text(c) for c in completions]
+
         # Truncation monitor
         n_truncated = sum(
-            1 for c in completions
-            if c.rstrip().count("{") > c.rstrip().count("}")
+            1 for t in texts
+            if t.rstrip().count("{") > t.rstrip().count("}")
         )
-        if n_truncated > len(completions) // 2:
+        if n_truncated > len(texts) // 2:
             print(
-                f"  [TRUNC WARN] {n_truncated}/{len(completions)} completions "
+                f"  [TRUNC WARN] {n_truncated}/{len(texts)} completions "
                 f"appear truncated (unclosed JSON). "
                 f"Consider raising MAX_COMP_LENGTH={MAX_COMP_LENGTH}.",
                 file=sys.stderr, flush=True,
             )
 
         # Periodic sample
-        emit_sample = bool(completions) and (
-            (step_counter[0] % sample_every) < len(completions)
+        emit_sample = bool(texts) and (
+            (step_counter[0] % sample_every) < len(texts)
         )
-        sample_completion: Optional[str] = completions[0] if emit_sample else None
+        sample_completion: Optional[str] = texts[0] if emit_sample else None
+
+        print(
+            f"  [reward] step={step_counter[0]}  task={task_id}  "
+            f"n={len(texts)}  scoring...",
+            flush=True,
+        )
 
         # Score each completion
-        for completion in completions:
-            action_dict = _extract_json(completion)
+        for i, text in enumerate(texts):
+            action_dict = _extract_json(text)
             parse_failed = action_dict is None
             parse_ok.append(not parse_failed)
 
@@ -1039,6 +1064,11 @@ def make_reward_fn(
                 rewards.append(0.0)
                 if task_id in zero_bufs:
                     zero_bufs[task_id].append(True)
+                print(
+                    f"    [{i+1}/{len(texts)}] parse=FAIL  reward=0.000  "
+                    f"preview={repr(text[:60])}",
+                    flush=True,
+                )
                 continue
 
             action_dict["task_id"] = task_id
@@ -1064,6 +1094,12 @@ def make_reward_fn(
 
             # Blended reward: format gives gradient early; env dominates later
             reward = round(env_w * env_reward + fmt_w * fmt_score, 5)
+
+            print(
+                f"    [{i+1}/{len(texts)}] parse=OK  "
+                f"env={env_reward:.3f}  fmt={fmt_score:.2f}  reward={reward:.4f}",
+                flush=True,
+            )
 
             rewards.append(reward)
             if task_id in zero_bufs:
