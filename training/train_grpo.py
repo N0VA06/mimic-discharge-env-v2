@@ -102,6 +102,7 @@ warnings.filterwarnings(
 )
 # ── End warning suppression ───────────────────────────────────────────────────
 
+import random
 import requests
 import torch
 
@@ -184,24 +185,36 @@ def fetch_pool_sizes(env_url: str) -> Dict[str, int]:
 
 
 def _resolve_mode(preferred_mode: str, pool_sizes: Dict[str, int]) -> str:
-    """
-    Return preferred_mode if its tier has ≥ MIN_TIER_POOL patients,
-    otherwise fall back to "random" so training isn't bottlenecked on a
-    tiny pool cycling the same few hadm_ids hundreds of times.
+    """Return the effective curriculum mode for this phase.
+
+    When easy_only is below MIN_TIER_POOL, return "easy_medium" so the caller
+    can sample proportionally from easy+medium patients, keeping hard cases out
+    of Phase 1.  Other under-sized tiers fall back to "random".
     """
     tier_map = {"easy_only": "easy", "medium_only": "medium", "hard_only": "hard"}
     tier = tier_map.get(preferred_mode)
     if tier and pool_sizes.get(tier, 0) < MIN_TIER_POOL:
-        actual = pool_sizes.get(tier, 0)
-        total  = sum(pool_sizes.values()) or 1
-        print(
-            f"[pool] {preferred_mode!r} has only {actual} patients "
-            f"(need ≥{MIN_TIER_POOL}) — falling back to 'random' "
-            f"({total} total patients available)",
-            flush=True,
-        )
+        if preferred_mode == "easy_only":
+            return "easy_medium"
         return "random"
     return preferred_mode
+
+
+def _pick_mode(mode: str, pool_sizes: Dict[str, int]) -> str:
+    """Resolve the pseudo-mode 'easy_medium' to a concrete env curriculum mode.
+
+    Randomly picks 'easy_only' or 'medium_only' weighted by their pool sizes
+    so each episode reflects the natural patient distribution.  All other modes
+    pass through unchanged.
+    """
+    if mode != "easy_medium":
+        return mode
+    easy   = pool_sizes.get("easy",   0)
+    medium = pool_sizes.get("medium", 0)
+    total  = easy + medium
+    if total == 0:
+        return "random"
+    return "easy_only" if random.random() < (easy / total) else "medium_only"
 
 
 # ── Curriculum ────────────────────────────────────────────────────────────────
@@ -930,6 +943,7 @@ def build_seed_dataset(
     noise_level:     str,
     curriculum_mode: str,
     logger:          Optional[TrainingLogger] = None,
+    pool_sizes:      Optional[Dict[str, int]] = None,
 ) -> Dataset:
     from training.rollout_collector import format_observation, _SYSTEM_PROMPT
 
@@ -939,10 +953,13 @@ def build_seed_dataset(
     fail = 0
     for i in range(n):
         try:
+            # Resolve pseudo-modes (e.g. "easy_medium") per episode so each
+            # reset independently samples from the correct tier distribution.
+            episode_mode = _pick_mode(curriculum_mode, pool_sizes) if pool_sizes else curriculum_mode
             obs = _env_post(env_url, "/reset", {
                 "task_id":         task_id,
                 "noise_level":     noise_level,
-                "curriculum_mode": curriculum_mode,
+                "curriculum_mode": episode_mode,
             })
             if task_id == 2:
                 meds_empty = not (obs.get("pharmacy_active") or obs.get("medications"))
@@ -1076,10 +1093,11 @@ def make_reward_fn(
             action_dict = _norm_action(action_dict, task_id)
 
             try:
+                episode_mode = _pick_mode(curriculum_mode, pool_sizes or {})
                 _env_post(env_url, "/reset", {
                     "task_id":         task_id,
                     "noise_level":     noise_level,
-                    "curriculum_mode": curriculum_mode,
+                    "curriculum_mode": episode_mode,
                 })
                 if task_id == 2:
                     _env_post(env_url, "/step", {
@@ -1204,13 +1222,16 @@ def train(
         f"(MIN_TIER_POOL={MIN_TIER_POOL})",
         flush=True,
     )
-    for tier, count in pool_sizes.items():
-        if 0 < count < MIN_TIER_POOL:
-            print(
-                f"[pool] WARNING: '{tier}' tier has only {count} patients — "
-                f"curriculum will fall back to 'random' for this phase.",
-                flush=True,
-            )
+    easy = pool_sizes.get("easy", 0)
+    if 0 < easy < MIN_TIER_POOL:
+        medium = pool_sizes.get("medium", 0)
+        pct_easy = easy / (easy + medium) * 100 if (easy + medium) else 0
+        print(
+            f"[pool] WARNING: 'easy' tier has only {easy} patients (need ≥{MIN_TIER_POOL}) — "
+            f"Phase 1 will use 'easy_medium' mix (~{pct_easy:.0f}% easy / "
+            f"~{100-pct_easy:.0f}% medium) to avoid training on hard cases.",
+            flush=True,
+        )
 
     if resume_from:
         elapsed_offset = load_train_state(
@@ -1242,6 +1263,7 @@ def train(
 
         dataset = build_seed_dataset(
             env_url, task_id, seed_n, noise_level, curr_mode, logger,
+            pool_sizes=pool_sizes,
         )
 
         grpo_cfg = GRPOConfig(
