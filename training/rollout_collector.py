@@ -49,18 +49,21 @@ MAX_RETRIES = 3
 
 # ─── Task-specific schemas (mirror of inference.py) ───────────────────────────
 
-_T1_SCHEMA = """Output EXACTLY:
-{"task_id": 1, "task1": {"disposition": "<expired|hospice|ama|snf|rehab|home_with_services|home|other>", "reasoning": "<20-50 words citing specific evidence>"}}
+_T1_SCHEMA = """Output EXACTLY this JSON and nothing else:
+{"task_id": 1, "task1": {"disposition": "<one of the values below>", "reasoning": "<ONE sentence, max 20 words>"}}
+
+Valid disposition values: expired | hospice | ama | snf | rehab | home_with_services | home | other
 
 DECISION ORDER (first match wins):
-1. HOSPICE  → ICD V667/Z51.5 (palliative care), secondary malignant neoplasm + DRG mortality=4.0, GCS≤5 with terminal dx
-2. EXPIRED  → patient explicitly died
+1. HOSPICE  → ICD V667/Z51.5/palliative, secondary malignant neoplasm + DRG mortality=4, GCS≤5 + terminal dx
+2. EXPIRED  → patient died during admission
 3. SNF      → ventilation hours>0 OR dialysis, non-terminal, age>60
-4. REHAB    → orthopedic fracture with surgical fixation, younger patient
-5. HOME WITH SERVICES → needs wound care, IV antibiotics, or home nurse at discharge
+4. REHAB    → orthopedic fracture + surgical fixation, younger patient, good functional baseline
+5. HOME WITH SERVICES → wound care, IV antibiotics, or home nurse needed at discharge
 6. HOME     → stable, oral meds only, short LOS, discharge orders finalized
 
-CRITICAL: Terminal cancer / palliative ICD → ALWAYS hospice, never snf/home"""
+CRITICAL: Terminal cancer / palliative ICD → hospice ONLY. Never snf or home.
+CRITICAL: reasoning MUST be one sentence under 20 words. Do NOT elaborate."""
 
 _T2_SCHEMA = """Output EXACTLY:
 {"task_id": 2, "task2": {"follow_up_specialties": ["<spec>"], "medications_to_continue": ["<drug>"], "medications_to_discontinue": ["<drug>"], "key_instructions": ["<instruction with numbers/thresholds>", ...x5], "reasoning": "<max 20 words>"}}
@@ -424,9 +427,14 @@ class _EnvClient:
 # ─── Observation formatter ────────────────────────────────────────────────────
 
 def format_observation(obs: Dict[str, Any], task_id: Optional[int] = None) -> str:
-    """Convert raw observation dict to structured clinical prompt for the LLM."""
+    """Convert raw observation dict to structured clinical prompt for the LLM.
+
+    Returns the USER-facing content only — caller is responsible for wrapping
+    with the system prompt in a proper chat template.  (_llm() and
+    build_seed_dataset both do this via message-list formatting.)
+    """
     tid = task_id or int(obs.get("task_id") or obs.get("task_id_hint") or 1)
-    lines: List[str] = [_SYSTEM_PROMPT, "", "=== PATIENT SUMMARY ==="]
+    lines: List[str] = ["=== PATIENT SUMMARY ==="]
 
     los = obs.get("hospital_los_days", 0)
     lines.append(

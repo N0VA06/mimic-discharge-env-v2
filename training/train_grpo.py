@@ -118,11 +118,11 @@ from datasets import Dataset
 
 # ── Hardware / training constants for L4 24 GB ───────────────────────────────
 ENV_TIMEOUT       = 30
-MAX_SEQ_LENGTH    = 2048   # prompt (1536) + completion (512)
+MAX_SEQ_LENGTH    = 2560   # prompt (1536) + completion (768) + buffer
 MAX_PROMPT_LENGTH = 1536
-MAX_COMP_LENGTH   = 512    # JSON + reasoning fits in ~300-400 tok
+MAX_COMP_LENGTH   = 768    # Task-1 reasoning was hitting 512 → truncation → parse fail
 NUM_GENERATIONS   = 8      # min for non-degenerate GRPO advantage
-BATCH_SIZE        = 2      # 8 gen x 2 batch x 2048 tok fits in 24 GB
+BATCH_SIZE        = 2      # 8 gen x 2 batch x 2560 tok fits in 24 GB
 GRAD_ACCUM        = 8      # effective batch = 2 x 8 = 16
 ZERO_WARN_AFTER   = 40     # buffer fill before firing zero-rate warning
 LORA_R            = 16
@@ -768,14 +768,16 @@ def _format_score(action_dict: Optional[Dict], task_id: int) -> float:
 def _reward_weights(task_id: int) -> Tuple[float, float]:
     """
     Returns (env_weight, format_weight).
-    Phase 1 (task 1) gives more weight to format so the model gets
-    gradient signal while it is still learning to produce valid JSON.
-    Later phases shift weight toward clinical accuracy (env reward).
+
+    Task 1: env=0.80 so correct dispositions produce meaningfully different
+    rewards (0.80 vs 0.40 vs 0.20 vs 0.04) rather than all collapsing to
+    the 0.35 format floor.  Format weight 0.20 still gives gradient when
+    the model can't parse — just less dominance once JSON works.
     """
     if task_id == 1:
-        return 0.65, 0.35
-    elif task_id == 2:
         return 0.80, 0.20
+    elif task_id == 2:
+        return 0.85, 0.15
     else:
         return 0.90, 0.10
 
@@ -857,7 +859,7 @@ def build_seed_dataset(
     curriculum_mode: str,
     logger:          Optional[TrainingLogger] = None,
 ) -> Dataset:
-    from training.rollout_collector import format_observation
+    from training.rollout_collector import format_observation, _SYSTEM_PROMPT
 
     print(f"[seed] Building {n} prompts  task={task_id}  "
           f"noise={noise_level}  curriculum={curriculum_mode} ...", flush=True)
@@ -881,7 +883,13 @@ def build_seed_dataset(
                     enriched = result.get("observation")
                     if enriched:
                         obs = enriched
-            rows.append({"prompt": format_observation(obs, task_id=task_id)})
+            # Store as proper message list so TRL applies the chat template
+            # correctly: system prompt in the <|im_start|>system turn, not user.
+            # Train-inference mismatch was the main cause of JSON format failures.
+            rows.append({"prompt": [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user",   "content": format_observation(obs, task_id=task_id)},
+            ]})
         except Exception as exc:
             fail += 1
             if fail <= 3:
@@ -942,13 +950,19 @@ def make_reward_fn(
         # Score each completion
         for completion in completions:
             action_dict = _extract_json(completion)
-            parse_ok.append(action_dict is not None)
+            parse_failed = action_dict is None
+            parse_ok.append(not parse_failed)
 
             # Format score: non-zero even on parse failure → always some gradient
             fmt_score = _format_score(action_dict, task_id)
 
-            if action_dict is None:
-                action_dict = {}
+            # Short-circuit: parse failure → fmt=0, env=0, no round-trip needed
+            if parse_failed:
+                rewards.append(0.0)
+                if task_id in zero_bufs:
+                    zero_bufs[task_id].append(True)
+                continue
+
             action_dict["task_id"] = task_id
             # Fix common LLM formatting mistakes (flat fields, wrong types, etc.)
             action_dict = _norm_action(action_dict, task_id)
