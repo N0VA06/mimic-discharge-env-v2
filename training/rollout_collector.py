@@ -772,8 +772,6 @@ class RolloutCollector:
                     stats[et] += 1
                 else:
                     stats["ok"] += 1
-
-            stats["ok"] += 1
             elapsed = round(time.time() - t0, 1)
             print(
                 f"Episode {ep_idx+1}/{n_episodes}  "

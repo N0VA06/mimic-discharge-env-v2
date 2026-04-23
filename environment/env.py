@@ -181,7 +181,11 @@ class MIMICDischargeEnv:
         else:
             pool = self.builder.hadm_ids
 
-        if not pool:
+        # Fall back to full patient pool if the tier is empty or dangerously
+        # small (< 10 unique patients).  A tiny pool causes the seed dataset
+        # to cycle the same few hadm_ids hundreds of times, collapsing prompt
+        # diversity and making GRPO advantage estimates degenerate.
+        if len(pool) < 10:
             pool = self.builder.hadm_ids
 
         return random.choice(pool)

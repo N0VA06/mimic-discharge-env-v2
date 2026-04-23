@@ -7,9 +7,11 @@ Framework       : TRL >= 0.12  +  Transformers >= 4.40
 
 Curriculum
 ----------
-  Steps    0 -  999 : Task 1  noise=clean    curriculum=easy_only
-  Steps 1000 - 2999 : Task 2  noise=clean    curriculum=medium_only
+  Steps    0 -  999 : Task 1  noise=clean    curriculum=random
+  Steps 1000 - 2999 : Task 2  noise=clean    curriculum=random
   Steps 3000+       : Task 3  noise=partial  curriculum=random
+  (Tier-based modes like easy_only/medium_only require a large patient pool;
+   the demo dataset has ~275 admissions so "easy" filtered to only 2 patients.)
 
 Checkpointing & Resume
 -----------------------
@@ -126,6 +128,7 @@ BATCH_SIZE        = 2      # 8 gen x 2 batch x 2560 tok fits in 24 GB
 GRAD_ACCUM        = 8      # effective batch = 2 x 8 = 16
 ZERO_WARN_AFTER   = 40     # buffer fill before firing zero-rate warning
 LORA_R            = 16
+MIN_TIER_POOL     = 25    # minimum patients in a complexity tier to use tier-based curriculum
 
 
 # ── VRAM helpers ──────────────────────────────────────────────────────────────
@@ -151,16 +154,85 @@ def _vram_str() -> str:
             f"free={v['free']:.0f}MB / {v['total']:.0f}MB")
 
 
+# ── Complexity pool helpers ───────────────────────────────────────────────────
+
+def fetch_pool_sizes(env_url: str) -> Dict[str, int]:
+    """
+    Query /episodes/by_complexity and return {tier: count}.
+    Falls back to {"easy": 0, "medium": 0, "hard": 0} on error so callers
+    can still decide — they will see counts < MIN_TIER_POOL and fall back
+    to "random" automatically.
+    """
+    default = {"easy": 0, "medium": 0, "hard": 0}
+    try:
+        r = requests.get(
+            f"{env_url.rstrip('/')}/episodes/by_complexity",
+            timeout=ENV_TIMEOUT,
+        )
+        r.raise_for_status()
+        data = r.json()
+        totals = data.get("totals", {})
+        return {
+            "easy":   int(totals.get("easy",   0)),
+            "medium": int(totals.get("medium", 0)),
+            "hard":   int(totals.get("hard",   0)),
+        }
+    except Exception as exc:
+        print(f"[pool] /episodes/by_complexity failed: {exc} — defaulting to random",
+              file=sys.stderr, flush=True)
+        return default
+
+
+def _resolve_mode(preferred_mode: str, pool_sizes: Dict[str, int]) -> str:
+    """
+    Return preferred_mode if its tier has ≥ MIN_TIER_POOL patients,
+    otherwise fall back to "random" so training isn't bottlenecked on a
+    tiny pool cycling the same few hadm_ids hundreds of times.
+    """
+    tier_map = {"easy_only": "easy", "medium_only": "medium", "hard_only": "hard"}
+    tier = tier_map.get(preferred_mode)
+    if tier and pool_sizes.get(tier, 0) < MIN_TIER_POOL:
+        actual = pool_sizes.get(tier, 0)
+        total  = sum(pool_sizes.values()) or 1
+        print(
+            f"[pool] {preferred_mode!r} has only {actual} patients "
+            f"(need ≥{MIN_TIER_POOL}) — falling back to 'random' "
+            f"({total} total patients available)",
+            flush=True,
+        )
+        return "random"
+    return preferred_mode
+
+
 # ── Curriculum ────────────────────────────────────────────────────────────────
 
-def _curriculum(step: int) -> Tuple[int, str, str]:
-    """Return (task_id, noise_level, curriculum_mode) for a global step."""
+# Desired tier per phase.  _resolve_mode() will downgrade to "random" at
+# runtime if the actual patient count in a tier is below MIN_TIER_POOL.
+_CURRICULUM_PREFERRED = {
+    # (step_lo, step_hi): (task_id, noise_level, preferred_curriculum_mode)
+    (0,    999):  (1, "clean",   "easy_only"),
+    (1000, 2999): (2, "clean",   "medium_only"),
+    (3000, 9999): (3, "partial", "random"),
+}
+
+
+def _curriculum(step: int, pool_sizes: Optional[Dict[str, int]] = None) -> Tuple[int, str, str]:
+    """Return (task_id, noise_level, curriculum_mode) for a global step.
+
+    If pool_sizes is provided (fetched from the env at startup), the
+    preferred curriculum mode is validated against the real patient counts
+    and downgraded to "random" when the tier is too small to provide
+    meaningful diversity.
+    """
     if step < 1000:
-        return 1, "clean",   "easy_only"
+        tid, noise, preferred = 1, "clean",   "easy_only"
     elif step < 3000:
-        return 2, "clean",   "medium_only"
+        tid, noise, preferred = 2, "clean",   "medium_only"
     else:
-        return 3, "partial", "random"
+        tid, noise, preferred = 3, "partial", "random"
+
+    mode = _resolve_mode(preferred, pool_sizes) if pool_sizes else preferred
+    return tid, noise, mode
 
 
 def _phase_of(task_id: int) -> int:
@@ -899,7 +971,12 @@ def build_seed_dataset(
     print(f"[seed] Done: {built}/{n}  (failed={fail})", flush=True)
     if logger:
         logger.log_seed_build(task_id, built, n)
-    return Dataset.from_list(rows) if rows else Dataset.from_list([{"prompt": ""}])
+    if not rows:
+        raise RuntimeError(
+            f"[seed] All {n} episodes failed for task={task_id}. "
+            "Check env_url and server logs before training."
+        )
+    return Dataset.from_list(rows)
 
 
 # ── Reward function ───────────────────────────────────────────────────────────
@@ -912,6 +989,7 @@ def make_reward_fn(
     logger:        TrainingLogger,
     max_steps:     int,
     sample_every:  int = 32,
+    pool_sizes:    Optional[Dict[str, int]] = None,
 ) -> Any:
 
     # Import here to avoid circular imports at module level
@@ -923,7 +1001,7 @@ def make_reward_fn(
         **kwargs,
     ) -> List[float]:
 
-        task_id, noise_level, curriculum_mode = _curriculum(step_counter[0])
+        task_id, noise_level, curriculum_mode = _curriculum(step_counter[0], pool_sizes)
         env_w, fmt_w = _reward_weights(task_id)
         rewards:  List[float] = []
         parse_ok: List[bool]  = []
@@ -1079,6 +1157,25 @@ def train(
     t0             = time.time()
     elapsed_offset = 0.0
 
+    # Fetch patient pool sizes once so curriculum mode can be validated
+    # against the real distribution instead of blindly using easy_only/medium_only.
+    pool_sizes = fetch_pool_sizes(env_url)
+    total_pts  = sum(pool_sizes.values())
+    print(
+        f"[pool] Patient complexity distribution — "
+        f"easy={pool_sizes['easy']}  medium={pool_sizes['medium']}  "
+        f"hard={pool_sizes['hard']}  total={total_pts}  "
+        f"(MIN_TIER_POOL={MIN_TIER_POOL})",
+        flush=True,
+    )
+    for tier, count in pool_sizes.items():
+        if 0 < count < MIN_TIER_POOL:
+            print(
+                f"[pool] WARNING: '{tier}' tier has only {count} patients — "
+                f"curriculum will fall back to 'random' for this phase.",
+                flush=True,
+            )
+
     if resume_from:
         elapsed_offset = load_train_state(
             resume_from, step_counter, chunk_counter, zero_bufs,
@@ -1086,6 +1183,7 @@ def train(
 
     reward_fn = make_reward_fn(
         env_url, step_counter, chunk_counter, zero_bufs, logger, max_steps,
+        pool_sizes=pool_sizes,
     )
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -1093,7 +1191,7 @@ def train(
 
     while step_counter[0] < max_steps:
         chunk   = chunk_counter[0]
-        task_id, noise_level, curr_mode = _curriculum(step_counter[0])
+        task_id, noise_level, curr_mode = _curriculum(step_counter[0], pool_sizes)
 
         if task_id != prev_task_id:
             logger.log_phase_start(
@@ -1120,6 +1218,7 @@ def train(
             save_steps=eval_every // 2,
             warmup_steps=10,
             num_generations=NUM_GENERATIONS,
+            max_prompt_length=MAX_PROMPT_LENGTH,    # left-truncate long prompts
             max_completion_length=MAX_COMP_LENGTH,
             temperature=0.9,   # encourage diverse outputs; helps gradient flow
             top_p=0.95,

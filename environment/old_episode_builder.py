@@ -28,11 +28,23 @@ _VITAL_ITEMS: Dict[int, str] = {
     223900: "GCS Total",
 }
 
+# Discharge locations that imply high clinical complexity.
+# "HOME HEALTH CARE" and "AGAINST ADVICE" removed: home-with-services and AMA
+# are medium complexity, not hard — keeping them here shrank the hard pool
+# excessively while also leaving medium under-represented.
 _HARD_DISCHARGE_LOCATIONS = {
-    "SKILLED NURSING FACILITY", "REHAB", "HOSPICE", "DIED",
-    "HOME HEALTH CARE", "AGAINST ADVICE",
-    "CHRONIC/LONG TERM ACUTE CARE", "OTHER FACILITY",
+    "SKILLED NURSING FACILITY",
+    "REHAB",
+    "HOSPICE",
+    "DIED",
+    "CHRONIC/LONG TERM ACUTE CARE",
+    "OTHER FACILITY",
 }
+
+# Fragments that indicate plain home (no professional services at home).
+# Used by classify_complexity to separate "easy" from "medium" home discharges.
+_PLAIN_HOME_FRAGMENTS = {"HOME", "SELF", "DISCHARGED TO HOME", "RETURNED HOME"}
+_HOME_SERVICE_FRAGMENTS = {"HEALTH CARE", "WITH SERVICE", "WITH AIDE", "WITH VNA", "ASSISTED"}
 
 
 class EpisodeBuilder:
@@ -666,16 +678,25 @@ class EpisodeBuilder:
         fluid    = ep.get("fluid_balance") or {}
         icu_proc = ep.get("icu_procedure_summary") or {}
 
+        # ── EASY ──────────────────────────────────────────────────────────────
+        # Plain home discharge (no professional services at home), short-ish
+        # stay, no ICU, moderate diagnostic burden.
+        # Thresholds tuned so the easy pool has ≥ 25 patients in the demo
+        # dataset (needed for tier-based curriculum in train_grpo.py).
+        is_plain_home = any(frag in loc for frag in _PLAIN_HOME_FRAGMENTS)
+        has_home_services = any(frag in loc for frag in _HOME_SERVICE_FRAGMENTS)
         if (
-            loc == "HOME"
-            and los <= 4
+            is_plain_home
+            and not has_home_services
+            and los <= 10
             and len(icu_stay) == 0
-            and len(diagnoses) <= 5
+            and len(diagnoses) <= 12
         ):
             return "easy"
 
-        hard_loc      = any(h in loc for h in _HARD_DISCHARGE_LOCATIONS)
-        hard_vent     = (
+        # ── HARD ──────────────────────────────────────────────────────────────
+        hard_loc       = any(h in loc for h in _HARD_DISCHARGE_LOCATIONS)
+        hard_vent      = (
             len(icu_stay) > 0
             and float(icu_proc.get("ventilation_hours", 0) or 0) > 24
         )
