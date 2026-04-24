@@ -130,6 +130,12 @@ GRAD_ACCUM        = 8      # effective batch = 2 x 8 = 16
 ZERO_WARN_AFTER   = 40     # buffer fill before firing zero-rate warning
 LORA_R            = 16
 MIN_TIER_POOL     = 25    # minimum patients in a complexity tier to use tier-based curriculum
+# Rewards below this threshold are counted as "zero" in zero_bufs.
+# Must be above the wrong-task-key floor (e.g. task2 wrong key → 0.030)
+# but below the minimum valid same-task reward (task2 correct key, env=0 → 0.15).
+ZERO_REWARD_THRESHOLD = 0.12
+# Dead-gradient stop thresholds per task (fraction of "near-zero" rewards).
+DEAD_THRESHOLDS       = {1: 0.80, 2: 0.90, 3: 0.90}
 
 
 # ── VRAM helpers ──────────────────────────────────────────────────────────────
@@ -1014,27 +1020,36 @@ def _comp_text(c: Any) -> str:
 
 
 def make_reward_fn(
-    env_url:       str,
-    step_counter:  List[int],
-    chunk_counter: List[int],
-    zero_bufs:     Dict[int, Deque[bool]],
-    logger:        TrainingLogger,
-    max_steps:     int,
-    sample_every:  int = 32,
-    pool_sizes:    Optional[Dict[str, int]] = None,
+    env_url:         str,
+    step_counter:    List[int],
+    chunk_counter:   List[int],
+    zero_bufs:       Dict[int, Deque[bool]],
+    logger:          TrainingLogger,
+    max_steps:       int,
+    task_id:         int,
+    noise_level:     str,
+    curriculum_mode: str,
+    sample_every:    int = 32,
+    pool_sizes:      Optional[Dict[str, int]] = None,
 ) -> Any:
+    """Build the reward function with a FIXED task locked at chunk start.
+
+    task_id / noise_level / curriculum_mode are captured in the closure and do
+    NOT change during the chunk's trainer.train() call.  This prevents the
+    mid-chunk curriculum switch that collapsed all rewards to 0.030 when
+    step_counter crossed 1000 while the seed dataset was still task-1 prompts.
+    """
 
     # Import here to avoid circular imports at module level
     from training.rollout_collector import _normalize_action as _norm_action
+
+    env_w, fmt_w = _reward_weights(task_id)
 
     def reward_fn(
         prompts:     List[Any],
         completions: List[Any],
         **kwargs,
     ) -> List[float]:
-
-        task_id, noise_level, curriculum_mode = _curriculum(step_counter[0], pool_sizes)
-        env_w, fmt_w = _reward_weights(task_id)
         rewards:  List[float] = []
         parse_ok: List[bool]  = []
 
@@ -1121,9 +1136,9 @@ def make_reward_fn(
 
             rewards.append(reward)
             if task_id in zero_bufs:
-                zero_bufs[task_id].append(reward == 0.0)
+                zero_bufs[task_id].append(reward < ZERO_REWARD_THRESHOLD)
 
-        step_counter[0] += len(rewards)
+        step_counter[0] += 1  # count optimizer steps, not completions
 
         logger.log_reward_batch(
             global_step=step_counter[0],
@@ -1238,11 +1253,6 @@ def train(
             resume_from, step_counter, chunk_counter, zero_bufs,
         )
 
-    reward_fn = make_reward_fn(
-        env_url, step_counter, chunk_counter, zero_bufs, logger, max_steps,
-        pool_sizes=pool_sizes,
-    )
-
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     prev_task_id = None
 
@@ -1259,6 +1269,14 @@ def train(
 
         logger.log_chunk_start(
             chunk, step_counter[0], max_steps, task_id, noise_level, curr_mode,
+        )
+
+        # Build reward_fn fresh each chunk with the task LOCKED so it cannot
+        # switch mid-chunk as step_counter advances past a phase boundary.
+        reward_fn = make_reward_fn(
+            env_url, step_counter, chunk_counter, zero_bufs, logger, max_steps,
+            task_id=task_id, noise_level=noise_level, curriculum_mode=curr_mode,
+            pool_sizes=pool_sizes,
         )
 
         dataset = build_seed_dataset(
@@ -1310,13 +1328,21 @@ def train(
             chunk_counter, zero_bufs, t0, logger,
         )
 
-        # Dead-gradient check (threshold relaxed: model needs time to learn JSON)
+        # Dead-gradient check: stop if the CURRENT task's near-zero rate is
+        # consistently above its threshold.  Thresholds are higher for tasks
+        # 2/3 because partial credit is harder to obtain early in those phases.
         dead = False
         for tid, buf in zero_bufs.items():
             if len(buf) < 50:
                 continue
             zr = sum(buf) / len(buf)
-            if tid == task_id == 1 and zr > 0.80:
+            threshold = DEAD_THRESHOLDS.get(tid, 0.90)
+            if tid == task_id and zr > threshold:
+                print(
+                    f"  [DEAD] task={tid}  near-zero rate={zr:.0%} > {threshold:.0%}"
+                    f" — stopping training.",
+                    flush=True,
+                )
                 logger.log_dead_gradient(tid, zr)
                 dead = True
                 break
