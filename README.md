@@ -22,7 +22,7 @@ A clinical RL benchmark where an LLM agent makes real hospital discharge decisio
 
 **Every year ~20% of Medicare patients are readmitted within 30 days — costing $26B and representing systematic failures in discharge planning.**
 
-Discharge planning is the handoff between hospital care and what comes next.  A hospitalist must simultaneously decide:
+Discharge planning is the handoff between hospital care and what comes next.  A attending phyiscian must simultaneously decide:
 
 - **Where** does this patient go? (home, SNF, rehab, hospice, ICU step-down?)
 - **What** care continues at home? (which medications, which specialist follows up, what instructions?)
@@ -44,7 +44,7 @@ GET  /tasks  →  full task catalogue + scoring formulas
 GET  /state  →  current episode state + ground truth (debug only)
 ```
 
-**233 real hospital admissions** from MIMIC-IV demo, split by clinical complexity:
+**233 real hospital admissions** sourced from the MIMIC-IV demo dataset, categorized by clinical complexity. This can be scaled to the **full MIMIC-IV dataset**, which includes over **50,000 patients**.
 
 | Tier | Count | Profile |
 |------|-------|---------|
@@ -145,7 +145,7 @@ Step 10 score = `note_score × 0.60 + shaping_avg × 0.40 + consistency_bonus (0
 
 | Phase | Steps | Task | Patient pool | Seed dataset |
 |-------|-------|------|-------------|--------------|
-| 1 | 0–199 | Disposition | medium_only (109) | 220 samples |
+| 1 | 0–199 | Disposition | medium_only + easy(109 + 21) | 220 samples |
 | 2 | 200–349 | Care Plan | medium_only (109) | 220 samples |
 | 3 | 350–449 | Discharge Note | random (all 233) | 466 samples |
 | 4 | 450–549 | ICU Workflow | hard_only (103) | 210 samples |
@@ -192,7 +192,7 @@ Bimodal: cluster at 0.24–0.44 (partial credit — adjacent disposition or inco
 
 | Problem | Symptom | Fix |
 |---------|---------|-----|
-| **Hospice mode collapse** | Model output `hospice` 100% for 42 steps | Switched Phase 1 from easy_only (21 HOME-only patients) to medium_only (109 patients, diverse outcomes) |
+| **Hospice mode collapse** | Model output `hospice` 100% for 42 steps | Automatically switches to include class diversity; if only a single class is present, it defaults to including the “easy" category. |
 | **Prompt-reward decoupling** | Reward scored a random patient, not the one in the prompt | Store `hadm_id` in seed dataset; reward function pins `/reset` to that specific patient |
 | **Disposition string mismatch** | `"home with services"` scored 0.44 instead of 1.0 | Normalize `→ HOME_WITH_SERVICES` before env call |
 | **KL collapse / low entropy** | Reward variance too low for GRPO advantage estimation | β=0.04 KL penalty + top_entropy_quantile=0.8 (drop bottom 20% entropy completions) |
@@ -258,6 +258,7 @@ python -m training.train_grpo \
   --max_steps 550
 ```
 Install unsloth accelerate trl datasets peft (pip install unsloth accelerate trl datasets peft)
+
 **Collect offline rollouts:**
 ```bash
 python -m training.rollout_collector \
