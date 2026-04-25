@@ -97,7 +97,24 @@ MANDATORY:
    "The patient expired during this hospitalization."
 5. Sections in order: PRINCIPAL DIAGNOSIS | BRIEF HOSPITAL COURSE | KEY PROCEDURES PERFORMED | DISCHARGE CONDITION | DISCHARGE DISPOSITION | DISCHARGE MEDICATIONS | FOLLOW-UP INSTRUCTIONS"""
 
-_TASK_SCHEMAS = {1: _T1_SCHEMA, 2: _T2_SCHEMA, 3: _T3_SCHEMA}
+_T4_SCHEMA = """Output EXACTLY:
+{"task_id": 4, "task4": {"final_note": "<FULL ICU DISCHARGE NOTE ≥300 words>"}}
+
+This is STEP 10 (final discharge note) of the ICU workflow.
+MANDATORY in the note:
+1. Each top-5 diagnosis by its EXACT description keywords in prose
+2. ICU COURSE: ventilation hours (if any), dialysis (if used), LOS in days
+3. DISCHARGE MEDICATIONS: ONLY exact names from ACTIVE MEDICATIONS list
+4. Use one verbatim disposition phrase:
+   "The patient was discharged home." |
+   "The patient was discharged home with home health services." |
+   "The patient was transferred to a skilled nursing facility." |
+   "The patient was transferred to inpatient rehabilitation." |
+   "The patient was transitioned to hospice care." |
+   "The patient expired during this hospitalization."
+5. Sections in order: PRINCIPAL DIAGNOSIS | ICU COURSE | KEY PROCEDURES | DISCHARGE CONDITION | DISCHARGE DISPOSITION | DISCHARGE MEDICATIONS | FOLLOW-UP INSTRUCTIONS"""
+
+_TASK_SCHEMAS = {1: _T1_SCHEMA, 2: _T2_SCHEMA, 3: _T3_SCHEMA, 4: _T4_SCHEMA}
 
 _SYSTEM_PROMPT = (
     "You are a clinical physician producing structured discharge planning outputs. "
@@ -257,6 +274,29 @@ def _fallback_action(task_id: int, obs: Dict) -> Dict:
             "severe pain, or any sudden change in your condition."
         )
         return {"task_id": 3, "task3": {"discharge_note": note}}
+
+    if task_id == 4:
+        dx_list  = "\n".join(f"{i+1}. {d.get('description','Unknown')}" for i, d in enumerate(diagnoses[:5]))
+        drug_list = "\n".join(f"- {d}" for d in drugs_active) or "- No medications at discharge"
+        icu_phrase = f" The patient required {vent:.0f} hours of mechanical ventilation." if vent > 0 else ""
+        disp_phrase = (
+            "The patient was transitioned to hospice care." if eol else
+            "The patient was transferred to a skilled nursing facility." if facility else
+            "The patient was discharged home with home health services." if drugs_active else
+            "The patient was discharged home."
+        )
+        note = (
+            f"PRINCIPAL DIAGNOSIS: {diagnoses[0].get('description','Acute illness') if diagnoses else 'Acute illness'}\n\n"
+            f"ICU COURSE: The patient was admitted to the ICU for {los:.1f} days.{icu_phrase} "
+            f"The following diagnoses were managed:\n{dx_list}\n\n"
+            "KEY PROCEDURES: Routine ICU monitoring, laboratory evaluation, and supportive care.\n\n"
+            "DISCHARGE CONDITION: Clinically improved from admission baseline.\n\n"
+            f"DISCHARGE DISPOSITION: {disp_phrase}\n\n"
+            f"DISCHARGE MEDICATIONS:\n{drug_list}\n\n"
+            "FOLLOW-UP INSTRUCTIONS: Follow up with primary care within 1 week. "
+            "Return to ED for fever >38.5°C, chest pain, or worsening symptoms."
+        )
+        return {"task_id": 4, "task4": {"final_note": note}}
 
     return {"task_id": task_id}
 
@@ -620,8 +660,8 @@ class RolloutCollector:
         hadm_id: Optional[int] = None,
         noise_level: str = "clean",
     ) -> Dict:
-        if task_id not in (1, 2, 3):
-            raise ValueError(f"task_id {task_id} not supported for training (only 1-3)")
+        if task_id not in (1, 2, 3, 4):
+            raise ValueError(f"task_id {task_id} not supported (valid: 1-4)")
 
         reset_body: Dict[str, Any] = {"task_id": task_id, "noise_level": noise_level}
         if hadm_id is not None:
@@ -802,7 +842,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--env_url",     default="http://localhost:7860")
     parser.add_argument("--model_name",  default="Qwen/Qwen2.5-3B-Instruct")
-    parser.add_argument("--n_episodes",  type=int, default=64)
+    parser.add_argument("--n_episodes",  type=int, default=220,
+                        help="Episodes to collect. Recommended per task to cover each "
+                             "patient at least twice: T1=220 (medium 109×2), "
+                             "T2=220 (medium 109×2), T3=466 (all 233×2), T4=210 (hard 103×2)")
     parser.add_argument("--task_id",     type=int, default=1)
     parser.add_argument("--noise_level", default="clean")
     parser.add_argument("--output_path", default="./rollouts")

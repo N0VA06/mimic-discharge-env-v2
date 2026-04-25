@@ -5,13 +5,12 @@ Hardware target : 1x NVIDIA L4  (24 GB VRAM, 28 vCPU, 124 GB RAM)
 Model           : Qwen/Qwen2.5-3B-Instruct  (bfloat16, LoRA r=16)
 Framework       : TRL >= 0.12  +  Transformers >= 4.40
 
-Curriculum
+Curriculum  (7-hour L4 GPU budget — 550 total steps)
 ----------
-  Steps    0 -  999 : Task 1  noise=clean    curriculum=random
-  Steps 1000 - 2999 : Task 2  noise=clean    curriculum=random
-  Steps 3000+       : Task 3  noise=partial  curriculum=random
-  (Tier-based modes like easy_only/medium_only require a large patient pool;
-   the demo dataset has ~275 admissions so "easy" filtered to only 2 patients.)
+  Steps    0 -  199 : Task 1  noise=clean    curriculum=medium_only  (200 steps ~1.9h)
+  Steps  200 -  349 : Task 2  noise=clean    curriculum=medium_only  (150 steps ~1.5h)
+  Steps  350 -  449 : Task 3  noise=partial  curriculum=random       (100 steps ~1.5h)
+  Steps  450 -  549 : Task 4  noise=partial  curriculum=hard_only    (100 steps ~1.7h)
 
 Checkpointing & Resume
 -----------------------
@@ -129,13 +128,51 @@ BATCH_SIZE        = 2      # 8 gen x 2 batch x 2560 tok fits in 24 GB
 GRAD_ACCUM        = 8      # effective batch = 2 x 8 = 16
 ZERO_WARN_AFTER   = 40     # buffer fill before firing zero-rate warning
 LORA_R            = 16
-MIN_TIER_POOL     = 25    # minimum patients in a complexity tier to use tier-based curriculum
+MIN_EASY_POOL     = 10    # easy tier works with fewer patients (home-discharge cases, no hospice)
+MIN_TIER_POOL     = 25    # minimum for medium/hard tier curriculum
 # Rewards below this threshold are counted as "zero" in zero_bufs.
 # Must be above the wrong-task-key floor (e.g. task2 wrong key → 0.030)
 # but below the minimum valid same-task reward (task2 correct key, env=0 → 0.15).
 ZERO_REWARD_THRESHOLD = 0.12
 # Dead-gradient stop thresholds per task (fraction of "near-zero" rewards).
-DEAD_THRESHOLDS       = {1: 0.80, 2: 0.90, 3: 0.90}
+DEAD_THRESHOLDS       = {1: 0.80, 2: 0.90, 3: 0.90, 4: 0.90}
+
+# Minimum seed-dataset size per curriculum mode: at least 2× the unique patient pool
+# so every patient appears at least twice per chunk and the model sees full diversity.
+# Pool sizes confirmed from MIMIC demo: easy=21, medium=109, hard=103, total=233.
+_SEED_N_BY_MODE: Dict[str, int] = {
+    "easy_only":   44,   # 21 × 2
+    "medium_only": 220,  # 109 × 2  (T1 + T2)
+    "hard_only":   210,  # 103 × 2  (T4)
+    "random":      466,  # 233 × 2  (T3 — full patient pool)
+    "easy_medium": 260,  # (21+109) × 2 — fallback blend
+}
+
+
+def _chunk_seed_n(curr_mode: str, pool_sizes: Optional[Dict[str, int]], seed_n_floor: int) -> int:
+    """Return seed dataset size for one chunk.
+
+    Auto-scales to 2× the active patient pool so every unique patient appears
+    at least twice per chunk.  seed_n_floor acts as a user-supplied minimum.
+    """
+    mode_key = curr_mode if curr_mode in _SEED_N_BY_MODE else "random"
+    # Re-derive from live pool sizes when available so demo vs. full dataset works.
+    if pool_sizes:
+        easy   = pool_sizes.get("easy",   21)
+        medium = pool_sizes.get("medium", 109)
+        hard   = pool_sizes.get("hard",   103)
+        total  = pool_sizes.get("total",  easy + medium + hard)
+        pool_n = {
+            "easy_only":   easy,
+            "medium_only": medium,
+            "hard_only":   hard,
+            "random":      total,
+            "easy_medium": easy + medium,
+        }.get(mode_key, total)
+        auto = pool_n * 2
+    else:
+        auto = _SEED_N_BY_MODE.get(mode_key, 466)
+    return max(seed_n_floor, auto)
 
 
 # ── VRAM helpers ──────────────────────────────────────────────────────────────
@@ -193,16 +230,20 @@ def fetch_pool_sizes(env_url: str) -> Dict[str, int]:
 def _resolve_mode(preferred_mode: str, pool_sizes: Dict[str, int]) -> str:
     """Return the effective curriculum mode for this phase.
 
-    When easy_only is below MIN_TIER_POOL, return "easy_medium" so the caller
-    can sample proportionally from easy+medium patients, keeping hard cases out
-    of Phase 1.  Other under-sized tiers fall back to "random".
+    easy_only uses MIN_EASY_POOL (10) as its threshold — 21 easy patients
+    is plenty for Phase 1 and keeps hospice/cancer medium cases OUT of the
+    early curriculum.  Only if easy < 10 do we fall back to easy_medium.
+    Other tiers use the larger MIN_TIER_POOL (25).
     """
     tier_map = {"easy_only": "easy", "medium_only": "medium", "hard_only": "hard"}
     tier = tier_map.get(preferred_mode)
-    if tier and pool_sizes.get(tier, 0) < MIN_TIER_POOL:
-        if preferred_mode == "easy_only":
-            return "easy_medium"
-        return "random"
+    if tier:
+        count   = pool_sizes.get(tier, 0)
+        min_req = MIN_EASY_POOL if preferred_mode == "easy_only" else MIN_TIER_POOL
+        if count < min_req:
+            if preferred_mode == "easy_only":
+                return "easy_medium"
+            return "random"
     return preferred_mode
 
 
@@ -229,9 +270,17 @@ def _pick_mode(mode: str, pool_sizes: Dict[str, int]) -> str:
 # runtime if the actual patient count in a tier is below MIN_TIER_POOL.
 _CURRICULUM_PREFERRED = {
     # (step_lo, step_hi): (task_id, noise_level, preferred_curriculum_mode)
-    (0,    999):  (1, "clean",   "easy_only"),
-    (1000, 2999): (2, "clean",   "medium_only"),
-    (3000, 9999): (3, "partial", "random"),
+    #
+    # 7-hour L4 GPU budget: 550 total steps.
+    # T1/T2 ~35 s/step (short outputs); T3/T4 ~55-60 s/step (long outputs).
+    # Phase 1: medium_only — forces HOME vs HOME_WITH_SERVICES discrimination.
+    # Phase 2: Task 2 care plan, medium patients.
+    # Phase 3: Task 3 discharge note, random (all 233 patients).
+    # Phase 4: Task 4 ICU workflow (final_note), hard patients.
+    (0,   199): (1, "clean",   "medium_only"),
+    (200, 349): (2, "clean",   "medium_only"),
+    (350, 449): (3, "partial", "random"),
+    (450, 549): (4, "partial", "hard_only"),
 }
 
 
@@ -243,19 +292,21 @@ def _curriculum(step: int, pool_sizes: Optional[Dict[str, int]] = None) -> Tuple
     and downgraded to "random" when the tier is too small to provide
     meaningful diversity.
     """
-    if step < 1000:
-        tid, noise, preferred = 1, "clean",   "easy_only"
-    elif step < 3000:
+    if step < 200:
+        tid, noise, preferred = 1, "clean",   "medium_only"
+    elif step < 350:
         tid, noise, preferred = 2, "clean",   "medium_only"
-    else:
+    elif step < 450:
         tid, noise, preferred = 3, "partial", "random"
+    else:
+        tid, noise, preferred = 4, "partial", "hard_only"
 
     mode = _resolve_mode(preferred, pool_sizes) if pool_sizes else preferred
     return tid, noise, mode
 
 
 def _phase_of(task_id: int) -> int:
-    return {1: 1, 2: 2, 3: 3}.get(task_id, 1)
+    return {1: 1, 2: 2, 3: 3, 4: 4}.get(task_id, 1)
 
 
 # ── Logger ────────────────────────────────────────────────────────────────────
@@ -525,8 +576,16 @@ def load_train_state(
 
 # ── Visualisations ────────────────────────────────────────────────────────────
 
-_TASK_COLORS  = {1: "#4C8CF5", 2: "#F5A623", 3: "#7ED321"}
-_PHASE_COLORS = {1: "#DDEEFF", 2: "#FFF3CD", 3: "#D5F5E3"}
+_TASK_COLORS  = {1: "#4C8CF5", 2: "#F5A623", 3: "#7ED321", 4: "#E74C3C"}
+_PHASE_COLORS = {1: "#DDEEFF", 2: "#FFF3CD", 3: "#D5F5E3", 4: "#FDECEA"}
+
+# Curriculum phase boundaries — must match _curriculum() exactly
+_PHASE_BANDS = [
+    (0,   200, "Phase 1 / Task 1 (Disposition)",    1),
+    (200, 350, "Phase 2 / Task 2 (Care Plan)",      2),
+    (350, 450, "Phase 3 / Task 3 (Discharge Note)", 3),
+    (450, 550, "Phase 4 / Task 4 (ICU Workflow)",   4),
+]
 
 
 def _rolling(arr: List[float], w: int) -> List[float]:
@@ -552,11 +611,11 @@ def _shade_phases(ax: Any, steps: List[int]) -> None:
     if not steps:
         return
     max_s = max(steps)
-    for i, (lo, hi) in enumerate([(0, 1000), (1000, 3000), (3000, max_s + 1)]):
+    for lo, hi, _, phase in _PHASE_BANDS:
         clamp = min(hi, max_s)
         if clamp > lo:
             ax.axvspan(lo, clamp, alpha=0.07,
-                       color=list(_PHASE_COLORS.values())[i], zorder=0)
+                       color=_PHASE_COLORS[phase], zorder=0)
 
 
 def _save_fig(fig: Any, path: str) -> None:
@@ -626,26 +685,28 @@ def plot_all(
     _setup_ax(ax, "02 - JSON Parse Success Rate", "Global step", "Parse rate", (0, 1.05))
     p = str(out_dir / "02_parse_rate.png"); _save_fig(fig, p); saved.append(p)
 
-    # 03 Dead-Gradient Monitor
+    # 03 Dead-Gradient Monitor (all tasks)
     fig, ax = plt.subplots(figsize=(12, 4))
-    t1_steps = [s for s, t in zip(steps, task_ids) if t == 1]
-    t1_zero  = [z for z, t in zip(zero_rates, task_ids) if t == 1]
-    t1_sm    = _rolling(t1_zero, 50) if t1_zero else []
-    if t1_steps:
-        ax.fill_between(t1_steps, t1_zero, alpha=0.10, color="crimson")
-        ax.plot(t1_steps, t1_zero, alpha=0.15, color="crimson", lw=0.6, label="raw T1")
-        ax.plot(t1_steps, t1_sm,   color="crimson", lw=2.0, label="rolling-50")
+    _shade_phases(ax, steps)
+    for tid, col in _TASK_COLORS.items():
+        tx_steps = [s for s, t in zip(steps, task_ids) if t == tid]
+        tx_zero  = [z for z, t in zip(zero_rates, task_ids) if t == tid]
+        if not tx_steps:
+            continue
+        tx_sm = _rolling(tx_zero, 50)
+        ax.plot(tx_steps, tx_zero, alpha=0.15, color=col, lw=0.6)
+        ax.plot(tx_steps, tx_sm,   color=col,  lw=2.0, label=f"T{tid} rolling-50")
     ax.axhspan(0.60, 1.05, alpha=0.07, color="red")
     ax.axhspan(0.40, 0.60, alpha=0.05, color="goldenrod")
     ax.axhline(0.60, color="black",     linestyle="--", lw=1.5, label="60% HALT")
     ax.axhline(0.40, color="goldenrod", linestyle=":",  lw=1.2, label="40% WARN")
     ax.legend(fontsize=8)
-    _setup_ax(ax, "03 - Dead-Gradient Monitor (Task 1)",
-              "Global step (Task 1 only)", "Zero-reward rate", (0, 1.05))
+    _setup_ax(ax, "03 - Dead-Gradient Monitor (All Tasks)",
+              "Global step", "Zero-reward rate", (0, 1.05))
     p = str(out_dir / "03_dead_gradient.png"); _save_fig(fig, p); saved.append(p)
 
     # 04 Reward by Task (boxplot)
-    task_reward_map: Dict[int, List[float]] = {1: [], 2: [], 3: []}
+    task_reward_map: Dict[int, List[float]] = {1: [], 2: [], 3: [], 4: []}
     for r in records:
         tid = r["task_id"]
         if tid in task_reward_map:
@@ -679,17 +740,15 @@ def plot_all(
     fig, ax = plt.subplots(figsize=(12, 4))
     if steps:
         max_s = max(steps)
-        for lo, hi, label, color in [
-            (0,    min(1000, max_s), "Phase 1 / Task 1", _PHASE_COLORS[1]),
-            (1000, min(3000, max_s), "Phase 2 / Task 2", _PHASE_COLORS[2]),
-            (3000, max_s,            "Phase 3 / Task 3", _PHASE_COLORS[3]),
-        ]:
-            if hi > lo:
-                ax.axvspan(lo, hi, alpha=0.35, color=color, label=label)
-                ax.text((lo + hi) / 2, 1.02, label, ha="center", va="bottom",
+        for lo, hi, label, tid in _PHASE_BANDS:
+            lo_c, hi_c = min(lo, max_s), min(hi, max_s)
+            if hi_c > lo_c:
+                color = _PHASE_COLORS.get(tid, "#EEEEEE")
+                ax.axvspan(lo_c, hi_c, alpha=0.35, color=color, label=label)
+                ax.text((lo_c + hi_c) / 2, 1.02, label, ha="center", va="bottom",
                         fontsize=7, transform=ax.get_xaxis_transform(), alpha=0.7)
         ax.plot(steps, sm50, color="#1a1a2e", lw=2.0, label="rolling-50")
-        for b in [1000, 3000]:
+        for b in [200, 350, 450]:
             if b < max_s:
                 ax.axvline(b, color="#555", linestyle="--", lw=1.0, alpha=0.6)
     ax.legend(fontsize=8, loc="lower right")
@@ -828,7 +887,24 @@ _REQUIRED_FIELDS: Dict[int, List[str]] = {
     1: ["disposition"],
     2: ["follow_up_specialties", "medications_to_continue", "key_instructions"],
     3: ["discharge_note"],
+    4: ["final_note"],
 }
+
+# Default actions used to advance Task 4 env from step 1→9 so that all patient
+# info is revealed (labs at step 2, meds at step 4, etc.) before the model's
+# final_note (step 10) is submitted.  These produce reward=0 — they just
+# unlock the progressive info gates without contributing to the grader score.
+_T4_ADVANCE_DEFAULTS: List[Dict] = [
+    {"task_id": 4, "task4": {"triage_level": "icu"}},
+    {"task_id": 4, "task4": {"priority_labs": ["CBC", "BMP", "LFTs"], "priority_consults": ["Primary Care"]}},
+    {"task_id": 4, "task4": {"interventions": ["IV access", "continuous monitoring"]}},
+    {"task_id": 4, "task4": {"high_risk_medications": []}},
+    {"task_id": 4, "task4": {"antibiotic_strategy": "none", "antibiotics": []}},
+    {"task_id": 4, "task4": {"fluid_strategy": "maintain"}},
+    {"task_id": 4, "task4": {"ready_for_stepdown": False, "barriers": ["medical complexity"]}},
+    {"task_id": 4, "task4": {"predicted_disposition": "snf", "los_remaining_days": 3.0}},
+    {"task_id": 4, "task4": {"medications_to_continue": []}},
+]
 
 
 def _format_score(action_dict: Optional[Dict], task_id: int) -> float:
@@ -869,7 +945,9 @@ def _reward_weights(task_id: int) -> Tuple[float, float]:
         return 0.80, 0.20
     elif task_id == 2:
         return 0.85, 0.15
-    else:
+    elif task_id == 3:
+        return 0.90, 0.10
+    else:  # task 4
         return 0.90, 0.10
 
 
@@ -978,13 +1056,34 @@ def build_seed_dataset(
                     enriched = result.get("observation")
                     if enriched:
                         obs = enriched
+            if task_id == 4:
+                # Advance env through steps 1-9 so all fields are revealed in the
+                # prompt (labs at step 2, meds at step 4, etc.).  These default
+                # actions return reward=0 and just unlock the info gates.
+                for adv_action in _T4_ADVANCE_DEFAULTS:
+                    try:
+                        r4 = _env_post(env_url, "/step", adv_action)
+                        if r4.get("done"):
+                            break
+                        enriched = r4.get("observation")
+                        if enriched:
+                            obs = enriched
+                    except Exception:
+                        break
             # Store as proper message list so TRL applies the chat template
             # correctly: system prompt in the <|im_start|>system turn, not user.
             # Train-inference mismatch was the main cause of JSON format failures.
-            rows.append({"prompt": [
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user",   "content": format_observation(obs, task_id=task_id)},
-            ]})
+            #
+            # Also store hadm_id so the reward function can reset to the SAME
+            # patient that generated this prompt, making reward directly measure
+            # "did you correctly classify THIS patient" rather than a random one.
+            rows.append({
+                "prompt": [
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user",   "content": format_observation(obs, task_id=task_id)},
+                ],
+                "hadm_id": str(obs.get("hadm_id", "")),
+            })
         except Exception as exc:
             fail += 1
             if fail <= 3:
@@ -1037,7 +1136,7 @@ def make_reward_fn(
     task_id / noise_level / curriculum_mode are captured in the closure and do
     NOT change during the chunk's trainer.train() call.  This prevents the
     mid-chunk curriculum switch that collapsed all rewards to 0.030 when
-    step_counter crossed 1000 while the seed dataset was still task-1 prompts.
+    step_counter crossed a phase boundary while the seed dataset was still the prior task's prompts.
     """
 
     # Import here to avoid circular imports at module level
@@ -1048,6 +1147,7 @@ def make_reward_fn(
     def reward_fn(
         prompts:     List[Any],
         completions: List[Any],
+        hadm_id:     Optional[List[str]] = None,
         **kwargs,
     ) -> List[float]:
         rewards:  List[float] = []
@@ -1104,22 +1204,61 @@ def make_reward_fn(
                 continue
 
             action_dict["task_id"] = task_id
+            # Normalise disposition string: spaces/hyphens → underscores, uppercase
+            # so "home with services" and "HOME WITH SERVICES" both become
+            # "HOME_WITH_SERVICES" before the env round-trip.
+            if task_id == 1:
+                sub1 = action_dict.get("task1", {})
+                if isinstance(sub1, dict) and sub1.get("disposition"):
+                    sub1["disposition"] = (
+                        sub1["disposition"].strip().upper().replace(" ", "_").replace("-", "_")
+                    )
             # Fix common LLM formatting mistakes (flat fields, wrong types, etc.)
             action_dict = _norm_action(action_dict, task_id)
 
             try:
                 episode_mode = _pick_mode(curriculum_mode, pool_sizes or {})
-                _env_post(env_url, "/reset", {
+                # Pin the env to the same patient the model saw in the prompt.
+                # The seed dataset stores hadm_id per row; TRL forwards it here
+                # as the hadm_id kwarg list.  Without this, /reset picks a random
+                # patient and the reward doesn't measure "did you classify THIS
+                # patient correctly" — just population-level distribution matching.
+                reset_body: Dict = {
                     "task_id":         task_id,
                     "noise_level":     noise_level,
                     "curriculum_mode": episode_mode,
-                })
+                }
+                if hadm_id is not None and i < len(hadm_id) and hadm_id[i]:
+                    try:
+                        reset_body["hadm_id"] = int(hadm_id[i])
+                    except (ValueError, TypeError):
+                        pass  # fall back to random if id is malformed
+                _env_post(env_url, "/reset", reset_body)
                 if task_id == 2:
                     _env_post(env_url, "/step", {
                         "task_id":            2,
                         "information_request": ["labs", "medications", "microbiology"],
                     })
-                result = _env_post(env_url, "/step", action_dict)
+                    result = _env_post(env_url, "/step", action_dict)
+                elif task_id == 4:
+                    # Advance env steps 1-9 with minimal defaults (reward=0 each),
+                    # then submit the model's final_note as step 10 for the reward.
+                    for adv in _T4_ADVANCE_DEFAULTS:
+                        r4 = _env_post(env_url, "/step", adv)
+                        if r4.get("done"):
+                            break
+                    t4 = action_dict.get("task4", {})
+                    final_note = ""
+                    if isinstance(t4, dict):
+                        final_note = (t4.get("final_note") or
+                                      t4.get("discharge_note") or
+                                      t4.get("note") or "")
+                    result = _env_post(env_url, "/step", {
+                        "task_id": 4,
+                        "task4":   {"final_note": str(final_note)},
+                    })
+                else:
+                    result = _env_post(env_url, "/step", action_dict)
                 env_reward = float(result.get("reward", 0.0))
             except Exception as exc:
                 print(f"  [reward] env error: {exc}", file=sys.stderr, flush=True)
@@ -1137,6 +1276,28 @@ def make_reward_fn(
             rewards.append(reward)
             if task_id in zero_bufs:
                 zero_bufs[task_id].append(reward < ZERO_REWARD_THRESHOLD)
+
+        # Log disposition distribution for task 1 so mode collapse is visible immediately
+        if task_id == 1:
+            from collections import Counter as _Counter
+            disps = []
+            for text in texts:
+                d = _extract_json(text)
+                if d:
+                    sub = d.get("task1", {})
+                    if isinstance(sub, dict) and sub.get("disposition"):
+                        disps.append(sub["disposition"].lower().strip())
+            if disps:
+                counts = _Counter(disps)
+                n_uniq = len(counts)
+                d_str  = "  ".join(
+                    f"{dsp}:{cnt/len(disps):.0%}" for dsp, cnt in counts.most_common(5)
+                )
+                collapse_tag = "  !! MODE COLLAPSE" if n_uniq == 1 else ""
+                print(
+                    f"  [disp] unique={n_uniq}/{len(disps)}  {d_str}{collapse_tag}",
+                    flush=True,
+                )
 
         step_counter[0] += 1  # count optimizer steps, not completions
 
@@ -1186,12 +1347,12 @@ def train(
     env_url:     str           = "http://localhost:7860",
     output_dir:  str           = "./checkpoints",
     log_dir:     str           = "./logs",
-    max_steps:   int           = 5000,
-    eval_every:  int           = 200,
+    max_steps:   int           = 550,
+    eval_every:  int           = 50,
     batch_size:  int           = BATCH_SIZE,
     grad_accum:  int           = GRAD_ACCUM,
     lr:          float         = 5e-6,
-    seed_n:      int           = 256,
+    seed_n:      int           = 50,
     resume_from: Optional[str] = None,
 ) -> None:
 
@@ -1222,6 +1383,7 @@ def train(
         1: deque(maxlen=50),
         2: deque(maxlen=50),
         3: deque(maxlen=50),
+        4: deque(maxlen=50),
     }
     t0             = time.time()
     elapsed_offset = 0.0
@@ -1237,14 +1399,24 @@ def train(
         f"(MIN_TIER_POOL={MIN_TIER_POOL})",
         flush=True,
     )
-    easy = pool_sizes.get("easy", 0)
-    if 0 < easy < MIN_TIER_POOL:
-        medium = pool_sizes.get("medium", 0)
-        pct_easy = easy / (easy + medium) * 100 if (easy + medium) else 0
+    easy   = pool_sizes.get("easy",   0)
+    medium = pool_sizes.get("medium", 0)
+    hard   = pool_sizes.get("hard",   0)
+    print(
+        f"[pool] Curriculum tiers — easy={easy} (all HOME, trivial) | "
+        f"medium={medium} (56% HWS / 39% HOME, real discrimination) | "
+        f"hard={hard} (SNF/expired/rehab/hospice)",
+        flush=True,
+    )
+    print(
+        f"[pool] Phase 1 uses medium_only → model must distinguish HOME vs "
+        f"HOME_WITH_SERVICES from clinical features (not just 'always HOME').",
+        flush=True,
+    )
+    if medium < MIN_TIER_POOL:
         print(
-            f"[pool] WARNING: 'easy' tier has only {easy} patients (need ≥{MIN_TIER_POOL}) — "
-            f"Phase 1 will use 'easy_medium' mix (~{pct_easy:.0f}% easy / "
-            f"~{100-pct_easy:.0f}% medium) to avoid training on hard cases.",
+            f"[pool] WARNING: medium tier only {medium} patients (need ≥{MIN_TIER_POOL}) "
+            f"— Phase 1 will fall back to 'random'.",
             flush=True,
         )
 
@@ -1279,10 +1451,17 @@ def train(
             pool_sizes=pool_sizes,
         )
 
+        chunk_seed_n = _chunk_seed_n(curr_mode, pool_sizes, seed_n)
+        print(f"[seed] Task {task_id} mode={curr_mode}  seed_n={chunk_seed_n}  "
+              f"(floor={seed_n}, auto=2×pool)", flush=True)
         dataset = build_seed_dataset(
-            env_url, task_id, seed_n, noise_level, curr_mode, logger,
+            env_url, task_id, chunk_seed_n, noise_level, curr_mode, logger,
             pool_sizes=pool_sizes,
         )
+
+        # Phase-specific temperature: high early to escape local optima (hospice collapse),
+        # lower later when the model already produces diverse structured output.
+        phase_temperature = {1: 1.3, 2: 1.1, 3: 0.9}.get(task_id, 0.9)
 
         grpo_cfg = GRPOConfig(
             output_dir=str(_ckpt_dir(output_dir, chunk)),
@@ -1294,10 +1473,12 @@ def train(
             save_steps=eval_every // 2,
             warmup_steps=10,
             num_generations=NUM_GENERATIONS,
-            max_prompt_length=MAX_PROMPT_LENGTH,    # left-truncate long prompts
+            max_prompt_length=MAX_PROMPT_LENGTH,
             max_completion_length=MAX_COMP_LENGTH,
-            temperature=0.9,   # encourage diverse outputs; helps gradient flow
+            temperature=phase_temperature,
             top_p=0.95,
+            beta=0.04,               # KL penalty: keeps policy close to base model's diversity
+            top_entropy_quantile=0.8, # drop bottom 20% entropy completions per group
             seed=42,
             report_to="none",
             dataloader_num_workers=0,
@@ -1386,16 +1567,21 @@ def main() -> None:
     parser.add_argument("--env_url",     default="https://iinovaii-mimic-discharge-env-v2.hf.space")
     parser.add_argument("--output_dir",  default="./checkpoints")
     parser.add_argument("--log_dir",     default="./logs")
-    parser.add_argument("--max_steps",   type=int,   default=5000)
-    parser.add_argument("--eval_every",  type=int,   default=200,
-                        help="Steps per training chunk")
+    parser.add_argument("--max_steps",   type=int,   default=550,
+                        help="Total training steps. 7-hour L4 budget: T1=0-199(200), "
+                             "T2=200-349(150), T3=350-449(100), T4=450-549(100). "
+                             "T1/T2 ~35s/step; T3/T4 ~55s/step due to longer outputs.")
+    parser.add_argument("--eval_every",  type=int,   default=50,
+                        help="Steps per training chunk (checkpoint + seed rebuild frequency)")
     parser.add_argument("--batch_size",  type=int,   default=BATCH_SIZE,
                         help="Per-device batch (L4 24GB: keep at 2)")
     parser.add_argument("--grad_accum",  type=int,   default=GRAD_ACCUM,
                         help="Gradient accumulation steps")
     parser.add_argument("--lr",          type=float, default=5e-6)
-    parser.add_argument("--seed_n",      type=int,   default=256,
-                        help="Seed episodes per chunk")
+    parser.add_argument("--seed_n",      type=int,   default=50,
+                        help="Minimum seed episodes per chunk. Auto-scales to 2× the "
+                             "active patient pool (T1/T2 medium→220, T3 all→466, T4 hard→210). "
+                             "Pass a larger value to override the auto-minimum.")
     parser.add_argument("--resume_from", default=None,
                         help="Path to chunk_NNN dir to resume from")
     parser.add_argument("--replot",      default=None,
