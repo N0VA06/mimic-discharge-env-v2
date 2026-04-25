@@ -29,3 +29,96 @@
   Task 3 (discharge-note): 0.4345
   Task 4 (admission-to-discharge-workflow): 0.6452
   Overall: 0.4584
+(base) nova@alfa:~/Documents/claude-code/metaopenenv_hackathon$ python inference.py 
+[INFO] Server ready at http://localhost:7860
+[START] task=discharge-disposition env=mimic-discharge-planning model=meta-llama/Llama-3.1-8B-Instruct
+[STEP] step=1 action=disposition=hospice reward=0.55 done=true error=null
+[END] success=true steps=1 score=0.55 rewards=0.55
+[START] task=care-plan env=mimic-discharge-planning model=meta-llama/Llama-3.1-8B-Instruct
+[STEP] step=1 action=info_request=['labs', 'medications', 'microbiology'] reward=0.00 done=false error=null
+[STEP] step=2 action=specialties=[Infectious Disease,Gastroenterology] reward=0.60 done=true error=null
+[END] success=true steps=2 score=0.60 rewards=0.00,0.60
+[START] task=discharge-note env=mimic-discharge-planning model=meta-llama/Llama-3.1-8B-Instruct
+[STEP] step=1 action=note(234words) reward=0.59 done=true error=null
+[END] success=true steps=1 score=0.59 rewards=0.59
+[START] task=admission-to-discharge-workflow env=mimic-discharge-planning model=meta-llama/Llama-3.1-8B-Instruct
+[STEP] step=1 action=step_triage_level=icu reward=0.00 done=false error=null
+[STEP] step=2 action=['priority_labs', 'priority_consults'] reward=0.00 done=false error=null
+[STEP] step=3 action=['interventions'] reward=0.00 done=false error=null
+[STEP] step=4 action=['high_risk_medications'] reward=0.00 done=false error=null
+[STEP] step=5 action=step_antibiotic_strategy=empiric reward=0.00 done=false error=null
+[STEP] step=6 action=step_fluid_strategy=aggressive_resuscitation reward=0.00 done=false error=null
+[STEP] step=7 action=step_ready_for_stepdown=False reward=0.00 done=false error=null
+[STEP] step=8 action=step_predicted_disposition=home reward=0.00 done=false error=null
+[STEP] step=9 action=['medications_to_continue'] reward=0.00 done=false error=null
+[STEP] step=10 action=final_note(7words) reward=0.27 done=true error=null
+[END] success=true steps=10 score=0.27 rewards=0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.27
+
+=== FINAL SCORES ===
+  Task 1 (discharge-disposition): 0.5500
+  Task 2 (care-plan): 0.6042
+  Task 3 (discharge-note): 0.5858
+  Task 4 (admission-to-discharge-workflow): 0.2667
+  Overall: 0.5017
+(base) nova@alfa:~/Documents/claude-code/metaopenenv_hackathon$ python inference.py 
+[INFO] Server ready at http://localhost:7860
+[START] task=discharge-disposition env=mimic-discharge-planning model=meta-llama/Llama-3.1-8B-Instruct
+[STEP] step=1 action=disposition=hospice reward=0.30 done=true error=null
+[END] success=true steps=1 score=0.30 rewards=0.30
+[START] task=care-plan env=mimic-discharge-planning model=meta-llama/Llama-3.1-8B-Instruct
+[STEP] step=1 action=info_request=['labs', 'medications', 'microbiology'] reward=0.00 done=false error=null
+[STEP] step=2 action=specialties=[Orthopedics,Trauma Surgery] reward=0.73 done=true error=null
+[END] success=true steps=2 score=0.73 rewards=0.00,0.73
+[START] task=discharge-note env=mimic-discharge-planning model=meta-llama/Llama-3.1-8B-Instruct
+[STEP] step=1 action=note(254words) reward=0.46 done=true error=null
+[END] success=true steps=1 score=0.46 rewards=0.46
+[START] task=admission-to-discharge-workflow env=mimic-discharge-planning model=meta-llama/Llama-3.1-8B-Instruct
+[STEP] step=1 action=step_triage_level=icu reward=0.00 done=false error=null
+[STEP] step=2 action=['priority_labs', 'priority_consults'] reward=0.00 done=false error=null
+[STEP] step=3 action=['interventions'] reward=0.00 done=false error=null
+[STEP] step=4 action=['high_risk_medications'] reward=0.00 done=false error=null
+[STEP] step=5 action=step_antibiotic_strategy=targeted reward=0.00 done=false error=null
+[STEP] step=6 action=step_fluid_strategy=aggressive_resuscitation reward=0.00 done=false error=null
+[STEP] step=7 action=step_ready_for_stepdown=False reward=0.00 done=false error=null
+[STEP] step=8 action=step_predicted_disposition=home reward=0.00 done=false error=null
+[STEP] step=9 action=['medications_to_continue'] reward=0.00 done=false error=null
+[STEP] step=10 action=final_note(233words) reward=0.38 done=true error=null
+[END] success=true steps=10 score=0.38 rewards=0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.38
+
+=== FINAL SCORES ===
+  Task 1 (discharge-disposition): 0.3000
+  Task 2 (care-plan): 0.7333
+  Task 3 (discharge-note): 0.4563
+  Task 4 (admission-to-discharge-workflow): 0.3773
+  Overall: 0.4667
+(base) nova@alfa:~/Documents/claude-code/metaopenenv_hackathon$ python inference.py 
+[INFO] Server ready at http://localhost:7860
+[START] task=discharge-disposition env=mimic-discharge-planning model=meta-llama/Llama-3.1-8B-Instruct
+[STEP] step=1 action=disposition=hospice reward=0.05 done=true error=null
+[END] success=true steps=1 score=0.05 rewards=0.05
+[START] task=care-plan env=mimic-discharge-planning model=meta-llama/Llama-3.1-8B-Instruct
+[STEP] step=1 action=info_request=['labs', 'medications', 'microbiology'] reward=0.00 done=false error=null
+[STEP] step=2 action=specialties=[Primary Care,Cardiology] reward=0.68 done=true error=null
+[END] success=true steps=2 score=0.68 rewards=0.00,0.68
+[START] task=discharge-note env=mimic-discharge-planning model=meta-llama/Llama-3.1-8B-Instruct
+[STEP] step=1 action=note(247words) reward=0.55 done=true error=null
+[END] success=true steps=1 score=0.55 rewards=0.55
+[START] task=admission-to-discharge-workflow env=mimic-discharge-planning model=meta-llama/Llama-3.1-8B-Instruct
+[STEP] step=1 action=step_triage_level=icu reward=0.00 done=false error=null
+[STEP] step=2 action=['priority_labs', 'priority_consults'] reward=0.00 done=false error=null
+[STEP] step=3 action=['interventions'] reward=0.00 done=false error=null
+[STEP] step=4 action=['high_risk_medications'] reward=0.00 done=false error=null
+[STEP] step=5 action=step_antibiotic_strategy=empiric reward=0.00 done=false error=null
+[STEP] step=6 action=step_fluid_strategy=restrict_diuresis reward=0.00 done=false error=null
+[STEP] step=7 action=step_ready_for_stepdown=False reward=0.00 done=false error=null
+[STEP] step=8 action=step_predicted_disposition=home reward=0.00 done=false error=null
+[STEP] step=9 action=['medications_to_continue'] reward=0.00 done=false error=null
+[STEP] step=10 action=final_note(225words) reward=0.55 done=true error=null
+[END] success=true steps=10 score=0.55 rewards=0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.55
+
+=== FINAL SCORES ===
+  Task 1 (discharge-disposition): 0.0500
+  Task 2 (care-plan): 0.6750
+  Task 3 (discharge-note): 0.5468
+  Task 4 (admission-to-discharge-workflow): 0.5509
+  Overall: 0.4557
