@@ -559,16 +559,25 @@ def load_train_state(
 
 # ── Visualisations ────────────────────────────────────────────────────────────
 
-_TASK_COLORS  = {1: "#4C8CF5", 2: "#F5A623", 3: "#7ED321", 4: "#E74C3C"}
-_PHASE_COLORS = {1: "#DDEEFF", 2: "#FFF3CD", 3: "#D5F5E3", 4: "#FDECEA"}
+_TASK_COLORS  = {1: "#4361EE", 2: "#F4A261", 3: "#2DC653", 4: "#E63946"}
+_PHASE_COLORS = {1: "#E8EEFF", 2: "#FFF3E0", 3: "#E8F8EE", 4: "#FDECEA"}
+
+_TASK_META = {
+    1: {"label": "Task 1 – Disposition",    "diff": "Easy",      "steps": "0–199"},
+    2: {"label": "Task 2 – Care Plan",      "diff": "Medium",    "steps": "200–349"},
+    3: {"label": "Task 3 – Discharge Note", "diff": "Hard",      "steps": "350–449"},
+    4: {"label": "Task 4 – ICU Workflow",   "diff": "Very Hard", "steps": "450–549"},
+}
+_DIFF_COLOR = {"Easy": "#4361EE", "Medium": "#F4A261", "Hard": "#2DC653", "Very Hard": "#E63946"}
 
 # Curriculum phase boundaries — must match _curriculum() exactly
 _PHASE_BANDS = [
-    (0,   200, "Phase 1 / Task 1 (Disposition)",    1),
-    (200, 350, "Phase 2 / Task 2 (Care Plan)",      2),
-    (350, 450, "Phase 3 / Task 3 (Discharge Note)", 3),
-    (450, 550, "Phase 4 / Task 4 (ICU Workflow)",   4),
+    (0,   200, "Task 1\nDisposition\n(Easy)",        1),
+    (200, 350, "Task 2\nCare Plan\n(Medium)",        2),
+    (350, 450, "Task 3\nDischarge Note\n(Hard)",     3),
+    (450, 550, "Task 4\nICU Workflow\n(Very Hard)",  4),
 ]
+_PHASE_TRANSITIONS = [200, 350, 450]
 
 
 def _rolling(arr: List[float], w: int) -> List[float]:
@@ -581,13 +590,17 @@ def _rolling(arr: List[float], w: int) -> List[float]:
 
 def _setup_ax(ax: Any, title: str, xlabel: str, ylabel: str,
               ylim: Optional[Tuple] = None) -> None:
-    ax.set_title(title, fontsize=11, fontweight="bold", pad=7)
-    ax.set_xlabel(xlabel, fontsize=9)
-    ax.set_ylabel(ylabel, fontsize=9)
+    ax.set_title(title, fontsize=12, fontweight="bold", pad=10, color="#1a1a2e")
+    ax.set_xlabel(xlabel, fontsize=10, color="#333")
+    ax.set_ylabel(ylabel, fontsize=10, color="#333")
     if ylim:
         ax.set_ylim(*ylim)
-    ax.grid(True, alpha=0.22, linestyle="--")
-    ax.tick_params(labelsize=8)
+    ax.grid(True, alpha=0.18, linestyle="--", color="#aaa")
+    ax.tick_params(labelsize=9, colors="#444")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    for spine in ["left", "bottom"]:
+        ax.spines[spine].set_color("#ccc")
 
 
 def _shade_phases(ax: Any, steps: List[int]) -> None:
@@ -595,16 +608,33 @@ def _shade_phases(ax: Any, steps: List[int]) -> None:
         return
     max_s = max(steps)
     for lo, hi, _, phase in _PHASE_BANDS:
-        clamp = min(hi, max_s)
-        if clamp > lo:
-            ax.axvspan(lo, clamp, alpha=0.07,
-                       color=_PHASE_COLORS[phase], zorder=0)
+        hi_c = min(hi, max_s)
+        if hi_c > lo:
+            ax.axvspan(lo, hi_c, alpha=0.09, color=_PHASE_COLORS[phase], zorder=0)
+
+
+def _draw_transitions(ax: Any, max_s: int, ymax: float = 1.05) -> None:
+    for b in _PHASE_TRANSITIONS:
+        if b < max_s:
+            ax.axvline(b, color="#888", linestyle="--", lw=1.1, alpha=0.55, zorder=1)
+
+
+def _task_legend_handles(present_tasks: List[int]) -> List[Any]:
+    from matplotlib.patches import Patch
+    handles = []
+    for t in present_tasks:
+        m = _TASK_META[t]
+        handles.append(Patch(
+            facecolor=_TASK_COLORS[t], alpha=0.80,
+            label=f"{m['label']}  [{m['diff']}]  steps {m['steps']}",
+        ))
+    return handles
 
 
 def _save_fig(fig: Any, path: str) -> None:
     import matplotlib.pyplot as plt
-    fig.tight_layout()
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.tight_layout(pad=1.8)
+    fig.savefig(path, dpi=160, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"  [viz] -> {path}", flush=True)
 
@@ -623,6 +653,12 @@ def plot_all(
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
 
+    plt.rcParams.update({
+        "font.family":    "DejaVu Sans",
+        "axes.facecolor": "#FAFAFA",
+        "figure.facecolor": "white",
+    })
+
     out_dir = Path(log_dir) / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
     saved: List[str] = []
@@ -634,135 +670,206 @@ def plot_all(
     task_ids     = [r["task_id"]          for r in records]
     vram_mb      = [r.get("vram_alloc_mb", 0) for r in records]
 
+    present_tasks = sorted(set(task_ids))
+    max_s = max(steps) if steps else 1
+
     sm50  = _rolling(mean_rewards, 50)
     sm100 = _rolling(parse_rates, 100)
     sm50z = _rolling(zero_rates, 50)
 
-    # 01 Reward Curve
-    fig, ax = plt.subplots(figsize=(12, 4))
+    # ── 01 Reward Curve ────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(14, 5))
     _shade_phases(ax, steps)
-    ax.plot(steps, mean_rewards, alpha=0.15, color="steelblue",
-            linewidth=0.6, label="raw")
-    ax.plot(steps, sm50, color="steelblue", linewidth=2.0, label="rolling-50")
-    for tid, col in _TASK_COLORS.items():
+    _draw_transitions(ax, max_s)
+
+    # per-task scatter
+    for tid in present_tasks:
         xs = [s for s, t in zip(steps, task_ids) if t == tid]
         ys = [r for r, t in zip(mean_rewards, task_ids) if t == tid]
-        if xs:
-            ax.scatter(xs, ys, s=4, color=col, alpha=0.22, zorder=2)
-    legend_els = [Patch(facecolor=_TASK_COLORS[t], label=f"Task {t}", alpha=0.6)
-                  for t in sorted(_TASK_COLORS)]
-    legend_els.append(plt.Line2D([0], [0], color="steelblue", lw=2, label="rolling-50"))
-    ax.legend(handles=legend_els, fontsize=8, loc="upper left")
-    _setup_ax(ax, "01 - Reward Curve", "Global step", "Mean reward", (0, 1.05))
+        ax.scatter(xs, ys, s=6, color=_TASK_COLORS[tid], alpha=0.25, zorder=2)
+
+    ax.plot(steps, mean_rewards, alpha=0.18, color="#555", linewidth=0.7, zorder=3)
+    ax.plot(steps, sm50, color="#1a1a2e", linewidth=2.2, label="Rolling-50 mean", zorder=4)
+
+    # annotate peak reward per phase
+    for lo, hi, _, tid in _PHASE_BANDS:
+        phase_y = [y for s, y in zip(steps, mean_rewards) if lo <= s < hi]
+        if phase_y:
+            peak = max(phase_y)
+            peak_s = [s for s, y in zip(steps, mean_rewards) if lo <= s < hi and y == peak][0]
+            ax.annotate(f"peak {peak:.2f}", xy=(peak_s, peak),
+                        xytext=(peak_s, peak + 0.07),
+                        fontsize=7.5, ha="center", color=_TASK_COLORS[tid],
+                        arrowprops=dict(arrowstyle="-", color=_TASK_COLORS[tid], lw=0.8))
+
+    leg = _task_legend_handles(present_tasks)
+    leg.append(plt.Line2D([0], [0], color="#1a1a2e", lw=2.2, label="Rolling-50 mean"))
+    ax.legend(handles=leg, fontsize=8.5, loc="upper left",
+              framealpha=0.9, edgecolor="#ccc")
+    _setup_ax(ax, "Training Reward Curve — MIMIC Discharge Planning",
+              "Global Training Step", "Mean Reward  (0 – 1)", (0, 1.12))
     p = str(out_dir / "01_reward_curve.png"); _save_fig(fig, p); saved.append(p)
 
-    # 02 JSON Parse Rate
-    fig, ax = plt.subplots(figsize=(12, 4))
+    # ── 02 JSON Parse Rate ─────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(14, 4))
     _shade_phases(ax, steps)
-    ax.fill_between(steps, parse_rates, alpha=0.10, color="darkorange")
-    ax.plot(steps, parse_rates, alpha=0.15, color="darkorange", linewidth=0.6)
-    ax.plot(steps, sm100, color="darkorange", linewidth=2.0, label="rolling-100")
-    ax.axhline(0.80, color="red",      linestyle="--", lw=1.2, label="80% target")
-    ax.axhline(0.50, color="goldenrod", linestyle=":",  lw=1.0, label="50% floor")
-    ax.legend(fontsize=8)
-    _setup_ax(ax, "02 - JSON Parse Success Rate", "Global step", "Parse rate", (0, 1.05))
+    _draw_transitions(ax, max_s)
+    ax.fill_between(steps, parse_rates, alpha=0.12, color="#F4A261")
+    ax.plot(steps, parse_rates, alpha=0.20, color="#F4A261", linewidth=0.7)
+    ax.plot(steps, sm100, color="#c44b00", linewidth=2.2, label="Rolling-100 parse rate")
+    ax.axhline(0.80, color="#c0392b", linestyle="--", lw=1.4, label="80% target floor")
+    ax.axhline(0.50, color="#e67e22", linestyle=":",  lw=1.1, label="50% critical floor")
+    leg = _task_legend_handles(present_tasks)
+    leg += [
+        plt.Line2D([0], [0], color="#c44b00",  lw=2.2, label="Rolling-100"),
+        plt.Line2D([0], [0], color="#c0392b",  lw=1.4, linestyle="--", label="80% target"),
+    ]
+    ax.legend(handles=leg, fontsize=8.5, loc="lower left", framealpha=0.9, edgecolor="#ccc")
+    _setup_ax(ax, "JSON Parse Success Rate by Training Phase",
+              "Global Training Step", "Parse Rate", (0, 1.08))
     p = str(out_dir / "02_parse_rate.png"); _save_fig(fig, p); saved.append(p)
 
-    # 03 Dead-Gradient Monitor (all tasks)
-    fig, ax = plt.subplots(figsize=(12, 4))
+    # ── 03 Dead-Gradient Monitor ───────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(14, 4))
     _shade_phases(ax, steps)
-    for tid, col in _TASK_COLORS.items():
+    _draw_transitions(ax, max_s)
+    for tid in present_tasks:
+        col = _TASK_COLORS[tid]
         tx_steps = [s for s, t in zip(steps, task_ids) if t == tid]
         tx_zero  = [z for z, t in zip(zero_rates, task_ids) if t == tid]
         if not tx_steps:
             continue
         tx_sm = _rolling(tx_zero, 50)
-        ax.plot(tx_steps, tx_zero, alpha=0.15, color=col, lw=0.6)
-        ax.plot(tx_steps, tx_sm,   color=col,  lw=2.0, label=f"T{tid} rolling-50")
-    ax.axhspan(0.60, 1.05, alpha=0.07, color="red")
-    ax.axhspan(0.40, 0.60, alpha=0.05, color="goldenrod")
-    ax.axhline(0.60, color="black",     linestyle="--", lw=1.5, label="60% HALT")
-    ax.axhline(0.40, color="goldenrod", linestyle=":",  lw=1.2, label="40% WARN")
-    ax.legend(fontsize=8)
-    _setup_ax(ax, "03 - Dead-Gradient Monitor (All Tasks)",
-              "Global step", "Zero-reward rate", (0, 1.05))
+        ax.plot(tx_steps, tx_zero, alpha=0.18, color=col, lw=0.7)
+        m = _TASK_META[tid]
+        ax.plot(tx_steps, tx_sm, color=col, lw=2.2,
+                label=f"{m['label']} [{m['diff']}]")
+    ax.axhspan(0.60, 1.08, alpha=0.08, color="#c0392b")
+    ax.axhspan(0.40, 0.60, alpha=0.06, color="#e67e22")
+    ax.axhline(0.60, color="#c0392b", linestyle="--", lw=1.5, label="60%  → HALT training")
+    ax.axhline(0.40, color="#e67e22", linestyle=":",  lw=1.2, label="40%  → WARN zone")
+    ax.legend(fontsize=8.5, loc="upper right", framealpha=0.9, edgecolor="#ccc")
+    _setup_ax(ax, "Dead-Gradient Monitor — Zero-Reward Rate per Task",
+              "Global Training Step", "Zero-Reward Rate", (0, 1.08))
     p = str(out_dir / "03_dead_gradient.png"); _save_fig(fig, p); saved.append(p)
 
-    # 04 Reward by Task (boxplot)
-    task_reward_map: Dict[int, List[float]] = {1: [], 2: [], 3: [], 4: []}
+    # ── 04 Reward by Task (boxplot) ────────────────────────────────────────────
+    task_reward_map: Dict[int, List[float]] = {t: [] for t in range(1, 5)}
     for r in records:
         tid = r["task_id"]
         if tid in task_reward_map:
             task_reward_map[tid].extend(r.get("rewards", [r["mean_reward"]]))
     present = sorted(t for t in task_reward_map if task_reward_map[t])
     if present:
-        fig, ax = plt.subplots(figsize=(7, 5))
+        fig, ax = plt.subplots(figsize=(9, 6))
+        tick_labels = [
+            f"{_TASK_META[t]['label']}\n({_TASK_META[t]['diff']})" for t in present
+        ]
         bp = ax.boxplot(
             [task_reward_map[t] for t in present],
-            labels=[f"Task {t}" for t in present],
-            patch_artist=True, notch=False, widths=0.45,
+            tick_labels=tick_labels,
+            patch_artist=True, notch=False, widths=0.50,
         )
         for patch, t in zip(bp["boxes"], present):
-            patch.set_facecolor(_TASK_COLORS.get(t, "#AAAAAA"))
-            patch.set_alpha(0.70)
-        for el in ["whiskers", "caps", "fliers"]:
+            patch.set_facecolor(_TASK_COLORS[t])
+            patch.set_alpha(0.68)
+        for el in ["whiskers", "caps"]:
             for item in bp[el]:
-                item.set(color="#444", linewidth=1.1)
+                item.set(color="#555", linewidth=1.3)
+        for flier in bp["fliers"]:
+            flier.set(marker="o", color="#888", alpha=0.4, markersize=3)
         for med in bp["medians"]:
-            med.set(color="white", linewidth=2.0)
+            med.set(color="white", linewidth=2.2)
         for i, t in enumerate(present, 1):
-            m = sum(task_reward_map[t]) / len(task_reward_map[t])
-            ax.plot(i, m, "D", color="red", markersize=6, zorder=5,
-                    label="mean" if i == 1 else "")
-        ax.legend(fontsize=8)
-        _setup_ax(ax, "04 - Reward Distribution by Task",
-                  "Task", "Reward", (0, 1.05))
+            data = task_reward_map[t]
+            m = sum(data) / len(data)
+            ax.plot(i, m, "D", color="#c0392b", markersize=7, zorder=6,
+                    label="Mean" if i == 1 else "")
+            ax.text(i + 0.28, m, f"μ={m:.3f}", va="center",
+                    fontsize=8, color="#c0392b")
+        ax.legend(fontsize=9, framealpha=0.9, edgecolor="#ccc")
+        ax.set_xlabel("Task  (sorted by difficulty)", fontsize=10)
+        _setup_ax(ax, "Reward Distribution by Task & Difficulty",
+                  "Task  (sorted by difficulty)", "Reward  (0 – 1)", (0, 1.12))
         p = str(out_dir / "04_reward_by_task.png"); _save_fig(fig, p); saved.append(p)
 
-    # 05 Phase Timeline
-    fig, ax = plt.subplots(figsize=(12, 4))
+    # ── 05 Phase Timeline ──────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(14, 5))
     if steps:
-        max_s = max(steps)
         for lo, hi, label, tid in _PHASE_BANDS:
             lo_c, hi_c = min(lo, max_s), min(hi, max_s)
-            if hi_c > lo_c:
-                color = _PHASE_COLORS.get(tid, "#EEEEEE")
-                ax.axvspan(lo_c, hi_c, alpha=0.35, color=color, label=label)
-                ax.text((lo_c + hi_c) / 2, 1.02, label, ha="center", va="bottom",
-                        fontsize=7, transform=ax.get_xaxis_transform(), alpha=0.7)
-        ax.plot(steps, sm50, color="#1a1a2e", lw=2.0, label="rolling-50")
-        for b in [200, 350, 450]:
+            if hi_c <= lo_c:
+                continue
+            color = _PHASE_COLORS[tid]
+            ax.axvspan(lo_c, hi_c, alpha=0.38, color=color, zorder=0)
+            mid = (lo_c + hi_c) / 2
+            # Two-line label: task label + difficulty badge
+            m = _TASK_META[tid]
+            ax.text(mid, 0.97, m["label"], ha="center", va="top",
+                    fontsize=9, fontweight="bold", color=_TASK_COLORS[tid],
+                    transform=ax.get_xaxis_transform())
+            ax.text(mid, 0.90, f"[{m['diff']}]  steps {m['steps']}", ha="center", va="top",
+                    fontsize=7.5, color="#555",
+                    transform=ax.get_xaxis_transform())
+
+        ax.plot(steps, sm50, color="#1a1a2e", lw=2.2, label="Rolling-50 reward", zorder=4)
+
+        for b in _PHASE_TRANSITIONS:
             if b < max_s:
-                ax.axvline(b, color="#555", linestyle="--", lw=1.0, alpha=0.6)
-    ax.legend(fontsize=8, loc="lower right")
-    _setup_ax(ax, "05 - Curriculum Phase Timeline + Reward",
-              "Global step", "Rolling mean reward", (0, 1.05))
+                ax.axvline(b, color="#666", linestyle="--", lw=1.2, alpha=0.6, zorder=2)
+                ax.text(b + 3, 0.04, f"step {b}", fontsize=7.5, color="#666",
+                        rotation=90, va="bottom")
+
+        # annotate rolling mean at each transition
+        for b in _PHASE_TRANSITIONS:
+            idx = min(range(len(steps)), key=lambda i: abs(steps[i] - b))
+            val = sm50[idx]
+            ax.annotate(f"{val:.2f}", xy=(b, val), xytext=(b + 18, val + 0.05),
+                        fontsize=8, color="#333",
+                        arrowprops=dict(arrowstyle="-", color="#999", lw=0.8))
+
+    leg = _task_legend_handles(present_tasks)
+    leg.append(plt.Line2D([0], [0], color="#1a1a2e", lw=2.2, label="Rolling-50 reward"))
+    ax.legend(handles=leg, fontsize=8.5, loc="lower right",
+              framealpha=0.9, edgecolor="#ccc")
+    _setup_ax(ax, "Curriculum Phase Timeline — Reward by Task & Difficulty",
+              "Global Training Step", "Rolling Mean Reward  (0 – 1)", (0, 1.12))
     p = str(out_dir / "05_phase_timeline.png"); _save_fig(fig, p); saved.append(p)
 
-    # 06 Reward Histogram
+    # ── 06 Reward Histogram ────────────────────────────────────────────────────
     all_rewards: List[float] = []
     for r in records:
         all_rewards.extend(r.get("rewards", [r["mean_reward"]]))
     if all_rewards:
-        fig, ax = plt.subplots(figsize=(9, 5))
-        for lo, hi, label, color in [
-            (0.00, 0.10, "near-zero", "#ffcccc"),
-            (0.10, 0.40, "partial",   "#fff3cc"),
-            (0.40, 0.70, "good",      "#d5f5e3"),
-            (0.70, 1.01, "excellent", "#a9dfbf"),
-        ]:
-            ax.axvspan(lo, hi, alpha=0.25, color=color, label=label)
-        ax.hist(all_rewards, bins=40, color="steelblue",
-                alpha=0.70, edgecolor="white", lw=0.4, zorder=3)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        bands = [
+            (0.00, 0.10, "Near-zero  (parse fail / wrong class)", "#ffcccc"),
+            (0.10, 0.40, "Partial credit  (adjacent / incomplete)", "#fff3cc"),
+            (0.40, 0.70, "Good  (solid clinical reasoning)", "#d5f5e3"),
+            (0.70, 1.01, "Excellent  (exact / near-perfect)", "#a9dfbf"),
+        ]
+        for lo, hi, label, color in bands:
+            ax.axvspan(lo, hi, alpha=0.30, color=color, label=label, zorder=0)
+        ax.hist(all_rewards, bins=44, color="#4361EE",
+                alpha=0.72, edgecolor="white", lw=0.4, zorder=3)
         mean_val = sum(all_rewards) / len(all_rewards)
-        ax.axvline(mean_val, color="red", linestyle="--",
-                   lw=1.8, label=f"mean={mean_val:.3f}")
-        ax.legend(fontsize=8)
-        _setup_ax(ax, "06 - Overall Reward Histogram",
-                  "Reward", "Count", (0, ax.get_ylim()[1] * 1.1))
+        ax.axvline(mean_val, color="#c0392b", linestyle="--",
+                   lw=2.0, label=f"Overall mean = {mean_val:.3f}", zorder=5)
+        # per-task means
+        for tid in present_tasks:
+            data = task_reward_map.get(tid, [])
+            if data:
+                m = sum(data) / len(data)
+                ax.axvline(m, color=_TASK_COLORS[tid], linestyle=":",
+                           lw=1.4, alpha=0.80, zorder=4,
+                           label=f"T{tid} mean = {m:.3f}  [{_TASK_META[tid]['diff']}]")
+        ax.legend(fontsize=8.5, loc="upper right", framealpha=0.9, edgecolor="#ccc")
+        _setup_ax(ax, "Reward Distribution Across All Tasks",
+                  "Reward  (0 – 1)", "Sample Count")
+        ax.set_ylim(0, ax.get_ylim()[1] * 1.12)
         p = str(out_dir / "06_reward_histogram.png"); _save_fig(fig, p); saved.append(p)
 
-    # 07 Per-Chunk Summary
+    # ── 07 Per-Chunk Summary ───────────────────────────────────────────────────
     chunk_data: Dict[int, Dict] = {}
     for r in records:
         c = r["chunk"]
@@ -776,59 +883,133 @@ def plot_all(
                   for c in c_ids]
         c_task = [max(set(chunk_data[c]["task_ids"]),
                       key=chunk_data[c]["task_ids"].count) for c in c_ids]
-        colors = [_TASK_COLORS.get(t, "#AAAAAA") for t in c_task]
-        fig, ax = plt.subplots(figsize=(max(8, len(c_ids) * 0.5 + 2), 5))
-        ax.bar(c_ids, c_vals, color=colors, alpha=0.72, edgecolor="white", lw=0.5)
-        ax.plot(c_ids, c_vals, "o--", color="#333", lw=1.2, markersize=5, zorder=5)
-        for x, y in zip(c_ids, c_vals):
-            ax.text(x, y + 0.008, f"{y:.3f}", ha="center", va="bottom", fontsize=7)
-        legend_els = [Patch(facecolor=_TASK_COLORS[t], label=f"Task {t}", alpha=0.72)
-                      for t in sorted(_TASK_COLORS) if t in set(c_task)]
-        ax.legend(handles=legend_els, fontsize=8)
+        bar_colors = [_TASK_COLORS.get(t, "#AAAAAA") for t in c_task]
+        fig, ax = plt.subplots(figsize=(max(9, len(c_ids) * 0.7 + 2), 5))
+        bars = ax.bar(c_ids, c_vals, color=bar_colors, alpha=0.75,
+                      edgecolor="white", lw=0.6)
+        ax.plot(c_ids, c_vals, "o--", color="#1a1a2e", lw=1.4, markersize=6, zorder=5)
+        for x, y, b in zip(c_ids, c_vals, bars):
+            ax.text(x, y + 0.012, f"{y:.3f}", ha="center", va="bottom",
+                    fontsize=8, fontweight="bold", color="#222")
+            tid = c_task[c_ids.index(x)]
+            ax.text(x, -0.045, _TASK_META[tid]["diff"],
+                    ha="center", va="top", fontsize=7, color=_TASK_COLORS[tid],
+                    transform=ax.transData)
+        leg = _task_legend_handles(sorted(set(c_task)))
+        ax.legend(handles=leg, fontsize=8.5, loc="upper right",
+                  framealpha=0.9, edgecolor="#ccc")
         ax.set_xticks(c_ids)
-        ax.set_xticklabels([f"C{c}" for c in c_ids], fontsize=7, rotation=45)
-        top = max(c_vals) * 1.18 + 0.05 if c_vals else 1.0
-        _setup_ax(ax, "07 - Per-Chunk Mean Reward", "Chunk", "Mean reward", (0, top))
+        ax.set_xticklabels([f"Chunk {c}" for c in c_ids], fontsize=8, rotation=40, ha="right")
+        top = max(c_vals) * 1.22 + 0.04 if c_vals else 1.0
+        _setup_ax(ax, "Per-Chunk Mean Reward — Training Progression",
+                  "Training Chunk  (50 steps each)", "Mean Reward  (0 – 1)", (0, top))
         p = str(out_dir / "07_chunk_summary.png"); _save_fig(fig, p); saved.append(p)
 
-    # 08 VRAM Usage
+    # ── 08 Per-Task Learning Curves ───────────────────────────────────────────
+    if len(present_tasks) >= 1:
+        fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+        axes_flat = axes.flatten()
+        diff_labels = {1: "Easy", 2: "Medium", 3: "Hard", 4: "Very Hard"}
+
+        for panel, tid in enumerate([1, 2, 3, 4]):
+            ax = axes_flat[panel]
+            t_steps   = [s for s, t in zip(steps, task_ids) if t == tid]
+            t_rewards = [r for r, t in zip(mean_rewards, task_ids) if t == tid]
+
+            if not t_steps:
+                ax.text(0.5, 0.5, "No data yet", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=13, color="#aaa")
+                ax.set_facecolor(_PHASE_COLORS[tid])
+                meta = _TASK_META[tid]
+                _setup_ax(ax,
+                          f"{meta['label']}\n[{diff_labels[tid]}]  Steps {meta['steps']}",
+                          "Global Training Step", "Mean Reward", (0, 1.1))
+                continue
+
+            color = _TASK_COLORS[tid]
+            meta  = _TASK_META[tid]
+            ax.set_facecolor(_PHASE_COLORS[tid])
+
+            ax.scatter(t_steps, t_rewards, s=9, color=color, alpha=0.28, zorder=2)
+            ax.plot(t_steps, t_rewards, color=color, alpha=0.15, lw=0.7, zorder=2)
+
+            win = max(10, len(t_steps) // 8)
+            sm  = _rolling(t_rewards, win)
+            ax.plot(t_steps, sm, color=color, lw=2.2, zorder=4,
+                    label=f"Rolling-{win} mean")
+
+            mean_val = sum(t_rewards) / len(t_rewards)
+            ax.axhline(mean_val, color=color, lw=1.2, linestyle="--", alpha=0.65,
+                       label=f"Phase mean  {mean_val:.3f}")
+
+            if t_rewards:
+                peak   = max(t_rewards)
+                pk_s   = t_steps[t_rewards.index(peak)]
+                offset = min(0.12, 1.05 - peak)
+                ax.annotate(f"peak {peak:.2f}",
+                            xy=(pk_s, peak),
+                            xytext=(pk_s, peak + offset),
+                            fontsize=7.5, ha="center", color=color,
+                            arrowprops=dict(arrowstyle="-", color=color, lw=0.8))
+
+            ax.legend(fontsize=8, framealpha=0.9, edgecolor="#ccc", loc="lower right")
+            ax.text(0.015, 0.97, diff_labels[tid],
+                    transform=ax.transAxes, fontsize=9, fontweight="bold",
+                    ha="left", va="top", color=color,
+                    bbox=dict(boxstyle="round,pad=0.25", facecolor="white",
+                              edgecolor=color, alpha=0.85))
+            _setup_ax(ax,
+                      f"{meta['label']}  ·  Steps {meta['steps']}",
+                      "Global Training Step", "Mean Reward", (0, 1.1))
+
+        fig.suptitle("Per-Task Learning Curves — MIMIC Discharge Planning",
+                     fontsize=13, fontweight="bold", color="#1a1a2e", y=1.01)
+        fig.tight_layout(pad=2.0)
+        p = str(out_dir / "08_per_task_curves.png"); _save_fig(fig, p); saved.append(p)
+
+    # ── 09 VRAM Usage ─────────────────────────────────────────────────────────  # noqa: E265
     if any(v > 0 for v in vram_mb):
-        fig, ax = plt.subplots(figsize=(12, 3))
-        ax.plot(steps, vram_mb, color="mediumpurple", lw=1.5, label="allocated MB")
-        ax.fill_between(steps, vram_mb, alpha=0.12, color="mediumpurple")
-        ax.axhline(24 * 1024, color="red", linestyle="--", lw=1.0, label="24 GB limit")
-        ax.legend(fontsize=8)
-        _setup_ax(ax, "08 - GPU VRAM Allocated (MB)", "Global step", "VRAM (MB)")
-        p = str(out_dir / "08_vram_usage.png"); _save_fig(fig, p); saved.append(p)
+        fig, ax = plt.subplots(figsize=(14, 3))
+        _shade_phases(ax, steps)
+        ax.plot(steps, vram_mb, color="#7B2D8B", lw=1.6, label="Allocated VRAM (MB)")
+        ax.fill_between(steps, vram_mb, alpha=0.14, color="#7B2D8B")
+        ax.axhline(24 * 1024, color="#c0392b", linestyle="--",
+                   lw=1.2, label="L4 24 GB limit")
+        ax.legend(fontsize=8.5, framealpha=0.9, edgecolor="#ccc")
+        _setup_ax(ax, "GPU VRAM Usage — NVIDIA L4 24 GB",
+                  "Global Training Step", "VRAM Allocated (MB)")
+        p = str(out_dir / "09_vram_usage.png"); _save_fig(fig, p); saved.append(p)
 
-    # 09 Entropy + Loss + Clipped Ratio
+    # ── 09 Entropy + Loss + Clipped Ratio ─────────────────────────────────────
     if trl_records:
-        trl_steps = [r["step"]           for r in trl_records]
-        entropies = [r["entropy"]        for r in trl_records]
-        losses    = [r["loss"]           for r in trl_records]
-        clipped   = [r["clipped_ratio"]  for r in trl_records]
+        trl_steps = [r["step"]          for r in trl_records]
+        entropies = [r["entropy"]       for r in trl_records]
+        losses    = [r["loss"]          for r in trl_records]
+        clipped   = [r["clipped_ratio"] for r in trl_records]
 
-        fig, (a1, a2, a3) = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+        fig, (a1, a2, a3) = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
 
-        a1.plot(trl_steps, entropies, color="teal", lw=1.5)
-        a1.axhline(0.5, color="red", linestyle="--", lw=1.0, label="collapse threshold")
-        a1.legend(fontsize=8)
-        _setup_ax(a1, "09a - Entropy (higher = more diverse outputs)",
+        a1.plot(trl_steps, entropies, color="#0077B6", lw=1.6)
+        a1.axhline(0.5, color="#c0392b", linestyle="--", lw=1.2,
+                   label="Collapse threshold (0.5)")
+        a1.legend(fontsize=8.5, framealpha=0.9)
+        _setup_ax(a1, "Entropy — Higher = More Diverse Outputs (want > 0.5)",
                   "Step", "Entropy")
 
         a2.semilogy(trl_steps, [max(abs(l), 1e-12) for l in losses],
-                    color="coral", lw=1.5)
-        _setup_ax(a2, "09b - |Loss| (log scale)", "Step", "|Loss|")
+                    color="#E63946", lw=1.6)
+        _setup_ax(a2, "|Loss|  (log scale)", "Step", "|Loss|")
 
-        a3.plot(trl_steps, clipped, color="goldenrod", lw=1.5)
-        a3.axhline(0.90, color="red", linestyle="--", lw=1.2, label="danger: 90%")
-        a3.legend(fontsize=8)
-        _setup_ax(a3, "09c - Completion Clipped Ratio (want < 0.5)",
-                  "Step", "Clipped ratio", (0, 1.05))
+        a3.plot(trl_steps, clipped, color="#F4A261", lw=1.6)
+        a3.axhline(0.90, color="#c0392b", linestyle="--", lw=1.2,
+                   label="Danger: > 90% clipped")
+        a3.legend(fontsize=8.5, framealpha=0.9)
+        _setup_ax(a3, "Completion Clipped Ratio  (want < 0.50)",
+                  "Step", "Clipped Ratio", (0, 1.08))
 
-        fig.tight_layout()
-        p = str(out_dir / "09_entropy_loss.png")
-        fig.savefig(p, dpi=150, bbox_inches="tight")
+        fig.tight_layout(pad=2.0)
+        p = str(out_dir / "10_entropy_loss.png")
+        fig.savefig(p, dpi=160, bbox_inches="tight", facecolor="white")
         plt.close(fig)
         print(f"  [viz] -> {p}", flush=True)
         saved.append(p)

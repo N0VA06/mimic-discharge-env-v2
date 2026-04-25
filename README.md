@@ -85,6 +85,8 @@ Predict one of 8 canonical post-discharge placements from the patient's full EHR
 **Scoring:** Exact match = 1.0 · Clinically adjacent (e.g. SNF ↔ home-with-services) = 0.50 · Same broad group = 0.25 · Wrong group = 0.0.
 Key signals: ICD V667/Z51.5 → hospice · DRG mortality=4 + malignant neoplasm → hospice · ventilation/dialysis → SNF · orthopedic fixation → rehab · GCS ≤ 5 + terminal dx → hospice.
 
+> **Training:** Reward rises **0.24 → 0.73** over steps 0–199 as the model learns to read clinical features (DRG mortality, ventilation hours, ICD codes) to distinguish HOME / HOME\_WITH\_SERVICES / SNF / hospice.
+
 ---
 
 ### Task 2 — Care Plan Recommendation *(≤4 steps, efficiency-discounted)*
@@ -103,6 +105,8 @@ The submitted plan must specify:
 
 Ghost specialty penalty fires when the agent recommends a specialty with no supporting ICD code.
 
+> **Training:** Stabilizes at **~0.58–0.65** over steps 200–349 with specialty F1 and medication F1 both contributing. Efficiency multiplier rewards the optimal 2-step strategy (request labs/meds/micro → submit plan).
+
 ---
 
 ### Task 3 — Discharge Note Generation *(1 step)*
@@ -120,6 +124,8 @@ Write a complete clinical discharge summary (minimum 300 words) covering all 7 r
 **Scoring:** `0.30 × diagnosis_coverage + 0.20 × disposition_accuracy + 0.20 × medication_F1 + 0.15 × LOS_accuracy + 0.10 × structure_score + 0.05 × information_density − hallucination_penalty`.
 
 Anti-stuffing: diagnosis keywords must appear in sentences ≥5 words.  A sentence matching ≥3 diagnoses simultaneously scores zero (vague catch-all detection).  Drug names verified against both `prescriptions` and `emar_summary`.
+
+> **Training:** Reaches **~0.40–0.55** over steps 350–449 with high variance — long-form generation creates a harder reward signal. Parse rate drops to ~85% due to complex 7-section JSON structure.
 
 ---
 
@@ -141,6 +147,8 @@ Sequential clinical decision-making across a full ICU admission.  Sparse reward:
 | 10 | Final discharge note (composite reward) |
 
 Step 10 score = `note_score × 0.60 + shaping_avg × 0.40 + consistency_bonus (0.10) + trajectory_bonus (0.05) − revision_cost`.
+
+> **Training:** Sparse reward (steps 1–9 return 0) makes this the hardest phase. The model transfers note-writing knowledge from Task 3 and adapts to the ICU workflow wrapper. Mean reward builds from **~0.26 → 0.38** over steps 450–549 as parse rate recovers and consistency/trajectory bonuses accumulate.
 
 ---
 
@@ -172,31 +180,38 @@ Each phase auto-scales seed dataset to 2× patient pool (every patient appears �
 
 ![Reward Curve](logs/plots/01_reward_curve.png)
 
-| Phase | Task | Steps | Result |
-|-------|------|-------|--------|
-| Phase 1 | Disposition | 0–199 | Rises from **0.24 → 0.73** — model learns HOME vs HOME_WITH_SERVICES from clinical features |
-| Phase 2 | Care Plan | 200–349 | Stabilizes at **~0.58–0.65** — specialty + medication F1 both contributing |
-| Phase 3 | Discharge Note | 350–435 | **~0.40–0.55** with high variance — long-form generation, harder reward signal |
+| Phase | Task | Steps | Difficulty | Result |
+|-------|------|-------|------------|--------|
+| Phase 1 | Disposition | 0–199 | Easy | Rises from **0.24 → 0.73** — model learns HOME vs HOME\_WITH\_SERVICES from clinical features |
+| Phase 2 | Care Plan | 200–349 | Medium | Stabilizes at **~0.58–0.65** — specialty + medication F1 both contributing |
+| Phase 3 | Discharge Note | 350–449 | Hard | **~0.40–0.55** with high variance — long-form generation, harder reward signal |
+| Phase 4 | ICU Workflow | 450–549 | Very Hard | Builds **~0.26 → 0.38** — sparse reward with 9-step pre-advance; transfers note knowledge from T3 |
 
-**Overall mean reward: 0.517** across all tasks and steps.
+**Overall mean reward: 0.468** across all 550 steps and 4 tasks.
+
+### Per-Task Learning Curves
+
+![Per-Task Learning Curves](logs/plots/08_per_task_curves.png)
+
+Each panel shows reward across that task's training steps.  Task 1 has the steepest learning curve (simple classification). Task 4 starts lower due to sparse reward and the 9-step zero-reward advance per episode, but improves steadily as the model adapts the note-writing skills from Task 3.
 
 ### Curriculum Phase Timeline
 
 ![Phase Timeline](logs/plots/05_phase_timeline.png)
 
-Rolling-50 reward peaks at **0.73 at step ~195** (end of Task 1 phase), dips at the T1→T2 curriculum switch (new task schema), then recovers and holds at ~0.58–0.68 through Task 2.  Task 3 brings a natural dip as the model adapts to long-form generation.
+Rolling-50 reward peaks at **0.73 at step ~195** (end of Task 1 phase), dips at each curriculum switch, then recovers. Task 4 shows a shallower dip than Task 2 because the model already knows how to write discharge notes — it only needs to adapt to the ICU workflow wrapper and sparse reward signal.
 
 ### JSON Parse Rate
 
 ![Parse Rate](logs/plots/02_parse_rate.png)
 
-Stays at **≥95% through Tasks 1 and 2**.  Drops to ~85% in Task 3 (discharge notes have longer, more complex JSON) — still well above the 80% target floor.
+Stays at **≥95% through Tasks 1 and 2**.  Drops to ~85% in Task 3 (7-section JSON) and briefly to ~75% at the Task 4 switch (new `final_note` wrapper format), recovering to ~90% by step 549.
 
 ### Reward Distribution
 
 ![Reward Histogram](logs/plots/06_reward_histogram.png)
 
-Bimodal: cluster at 0.24–0.44 (partial credit — adjacent disposition or incomplete note) and a spread from 0.50–0.80 (good clinical reasoning).  Spike at 1.0 = exact matches on Task 1 dispositions.
+Bimodal: cluster at 0.24–0.44 (partial credit — adjacent disposition or incomplete note) and a spread from 0.50–0.80 (good clinical reasoning).  Spike at 1.0 = exact matches on Task 1 dispositions. Task 4 adds a mode at 0.30–0.40 reflecting the 0.60× note-score cap in the grader formula.
 
 ---
 
