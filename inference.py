@@ -17,7 +17,7 @@ load_dotenv()
 # ── Config ────────────────────────────────────────────────────────────────────
 ENV_URL      = os.getenv("ENV_URL",      "http://localhost:7860")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME   = os.getenv("MODEL_NAME",   "meta-llama/Llama-3.1-8B-Instruct")
+MODEL_NAME   = os.getenv("MODEL_NAME",   "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
 HF_TOKEN     = os.getenv("HF_TOKEN",     "")
 BENCHMARK    = "mimic-discharge-planning"
 MAX_STEPS    = 10

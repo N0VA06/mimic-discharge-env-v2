@@ -4,25 +4,23 @@
 
 1. [System Overview](#1-system-overview)
 2. [Data Layer — MIMIC-IV Episode Builder](#2-data-layer--mimic-iv-episode-builder)
-3. [Pydantic Schema Layer](#3-pydantic-schema-layer)
+3. [Observation Space](#3-observation-space)
 4. [Environment Core — MIMICDischargeEnv](#4-environment-core--mimicdischargeenv)
-5. [Task 1 — Discharge Disposition (Easy)](#5-task-1--discharge-disposition-easy)
-6. [Task 2 — Care Plan Recommendation (Medium)](#6-task-2--care-plan-recommendation-medium)
-7. [Task 3 — Discharge Note Generation (Hard)](#7-task-3--discharge-note-generation-hard)
-8. [Task 4 — Long-Horizon Workflow (Very Hard)](#8-task-4--long-horizon-workflow-very-hard)
+5. [Task 1 — Discharge Disposition](#5-task-1--discharge-disposition)
+6. [Task 2 — Care Plan Recommendation](#6-task-2--care-plan-recommendation)
+7. [Task 3 — Discharge Note Generation](#7-task-3--discharge-note-generation)
+8. [Task 4 — ICU Admission-to-Discharge Workflow](#8-task-4--icu-admission-to-discharge-workflow)
 9. [Stochastic Observation Masking](#9-stochastic-observation-masking)
-10. [Curriculum Learning](#10-curriculum-learning)
-11. [Multi-Agent / Multi-Step Design](#11-multi-agent--multi-step-design)
-12. [Training Pipeline](#12-training-pipeline)
-13. [Server API Layer](#13-server-api-layer)
-14. [End-to-End Request Flow](#14-end-to-end-request-flow)
-15. [curl Test Reference](#15-curl-test-reference)
+10. [GRPO Training Pipeline](#10-grpo-training-pipeline)
+11. [Server API Reference](#11-server-api-reference)
+12. [End-to-End Data Flow](#12-end-to-end-data-flow)
+13. [curl Test Reference](#13-curl-test-reference)
 
 ---
 
 ## 1. System Overview
 
-The environment is a **deterministic, server-backed reinforcement learning environment** for clinical discharge planning, grounded in real patient data from the MIMIC-IV Clinical Database Demo v2.2 (PhysioNet). An AI agent plays the role of a physician making sequential discharge decisions.
+The environment is a **deterministic, server-backed RL environment** for clinical discharge planning, grounded in real patient records from MIMIC-IV Clinical Database Demo v2.2.  An agent plays the role of an attending physician making sequential discharge decisions.
 
 ### Architecture
 
@@ -33,1465 +31,1217 @@ The environment is a **deterministic, server-backed reinforcement learning envir
                             │ HTTP JSON
                             ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                  FastAPI Server (server/app.py)              │
-│   POST /reset  POST /step  GET /health  GET /metrics        │
-│   POST /rollout  GET /complexity/{id}  GET /episodes/...    │
+│                  FastAPI Server  (server/app.py)             │
+│   POST /reset    POST /step    GET /health   GET /metrics   │
 └───────────────────────────┬─────────────────────────────────┘
-                            │ Python call
+                            │ Python
                             ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              MIMICDischargeEnv (environment/env.py)          │
-│   reset() → Observation                                     │
-│   step(Action) → StepResult                                 │
-│   state() → StateInfo                                       │
-└──────────┬────────────────────────┬────────────────────────┘
-           │                        │
-           ▼                        ▼
-┌────────────────────┐   ┌──────────────────────────────────┐
-│ EpisodeBuilder     │   │           Graders                 │
-│ old_episode_       │   │  Task1: DispositionGrader         │
-│ builder.py         │   │  Task2: CarePlanGrader            │
-│                    │   │  Task3: NoteGrader                │
-│ Reads MIMIC-IV CSV │   │  Task4: Task4Grader               │
-│ files at startup   │   └──────────────────────────────────┘
-└────────────────────┘
+│              MIMICDischargeEnv  (environment/env.py)         │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐│
+│  │EpisodeBuilder│  │Task Graders  │  │Observation Builder ││
+│  │(MIMIC-IV CSV)│  │T1 / T2 / T3  │  │Gating / Noise      ││
+│  └──────────────┘  │/ T4          │  └────────────────────┘│
+│                    └──────────────┘                         │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### Key Design Principles
-
-- **No LLM judge** — all graders are deterministic Python functions operating on structured MIMIC fields
-- **Reproducible** — pinning `hadm_id` + `noise_level` gives identical observations every run
-- **Progressive difficulty** — 4 tasks from single-step classification (Task 1) to 10-step sparse-reward workflow (Task 4)
-- **Training-aware** — stochastic masking, curriculum modes, and GRPO-compatible reward structure built in from the start
+**Key design decisions:**
+- All graders are **fully deterministic** — no LLM judge, no randomness in scoring
+- Every reward decomposes into clinically named partial signals
+- Task 2 uses information gating (agent requests data in steps before committing)
+- Task 4 has sparse reward (only step 10 scores; steps 1–9 accumulate shaping)
+- Observation noise is injected stochastically at reset time (clean / partial / noisy)
 
 ---
 
 ## 2. Data Layer — MIMIC-IV Episode Builder
 
-### File: `environment/old_episode_builder.py`
+**File:** `environment/old_episode_builder.py`
 
-The `EpisodeBuilder` class loads MIMIC-IV CSV tables once at startup and builds rich episode dicts on demand.
+Loads and joins MIMIC-IV CSV tables into structured episode dictionaries at startup.
 
-### Startup Loading
+### Source Tables
 
-```python
-class EpisodeBuilder:
-    def __init__(self, data_root: Optional[str] = None):
-        # Loads all tables into memory (pandas DataFrames)
-        # ~100MB of CSV for the demo dataset
-        self._load_tables()
-        self._build_complexity_index()  # pre-classifies all hadm_ids
-```
+| Table | Usage |
+|-------|-------|
+| `admissions.csv` | hadm_id, admission_type, admission_location, discharge_location, ethnicity, subject_id |
+| `patients.csv` | gender, anchor_age |
+| `diagnoses_icd.csv` + `d_icd_diagnoses.csv` | ICD codes, descriptions, sequence numbers |
+| `prescriptions.csv` | medication orders (drug, route, dose, start/stop time) |
+| `pharmacy.csv` | active discharge meds (`pharmacy_active`), stopped meds (`pharmacy_stopped`) |
+| `labevents.csv` + `d_labitems.csv` | lab results with abnormal flags |
+| `microbiologyevents.csv` | culture organisms |
+| `chartevents.csv` | vitals (HR, BP, SpO2, GCS, temp) |
+| `procedureevents.csv` + `d_items.csv` | ICU procedures (ventilation hours, dialysis, lines) |
+| `inputevents.csv` / `outputevents.csv` | fluid balance, net balance, oliguria flag |
+| `icustays.csv` | ICU unit names, LOS in ICU |
+| `emar.csv` / `emar_detail.csv` | medication administration records (`active_at_discharge` flag) |
+| `drgcodes.csv` | DRG codes with severity and mortality scores |
+| `transfers.csv` | care trajectory (ward path: ED → MICU → floor) |
 
-Tables loaded:
-| Table | Use |
-|-------|-----|
-| `hosp/admissions.csv` | Admission metadata, discharge location, LOS |
-| `hosp/patients.csv` | Age, gender |
-| `hosp/diagnoses_icd.csv` | ICD codes ranked by seq_num |
-| `hosp/prescriptions.csv` | Drug orders (drug name, route, dose) |
-| `hosp/pharmacy.csv` | Active vs stopped pharmacy records |
-| `hosp/labevents.csv` | Lab results (joined with labitems for labels) |
-| `hosp/microbiologyevents.csv` | Cultures, organisms, sensitivities |
-| `hosp/procedures_icd.csv` | ICD procedure codes |
-| `hosp/hcpcsevents.csv` | HCPCS categories |
-| `hosp/drgcodes.csv` | DRG codes with severity/mortality |
-| `hosp/emar.csv` | Electronic medication administration records |
-| `hosp/poe.csv` + `poe_detail.csv` | Provider order entries (discharge orders) |
-| `icu/icustays.csv` | ICU unit names, LOS per stay |
-| `icu/chartevents.csv` | Vital sign time series (lazy-filtered) |
-| `icu/inputevents.csv` | Fluid inputs (mL) |
-| `icu/outputevents.csv` | Fluid outputs including urine (mL) |
-| `icu/procedureevents.csv` | ICU procedures (ventilation, dialysis, lines) |
-| `icu/transfers.csv` | Care unit trajectory |
+### Complexity Tier Classification
 
-### `get_episode(hadm_id, noise_level)` — core method
+Patients are classified into three tiers at build time:
 
-Builds a complete episode dict for one hospitalisation:
+**Easy:** Short LOS (≤ 10 days), no ICU stay, ≤ 12 diagnoses, plain home discharge.
+All easy-tier patients discharge to plain `home` — no discrimination is needed, making them useless for training clinical reasoning.
 
-```python
-ep = {
-    "subject_id": int,
-    "hadm_id": int,
-    "age": int,
-    "gender": str,                    # "M" or "F"
-    "admission_type": str,            # "EMERGENCY", "ELECTIVE", etc.
-    "admission_location": str,
-    "discharge_location": str,        # ground truth for Task 1/4
-    "insurance": str,
-    "language": str,
-    "hospital_los_days": float,       # computed from admittime/dischtime delta
+**Hard:** Any of:
+- LOS > 14 days
+- Ventilation > 24 hours
+- Hard discharge location: `SKILLED NURSING FACILITY`, `REHAB`, `HOSPICE`, `DIED`, `CHRONIC/LONG TERM ACUTE CARE`, `OTHER FACILITY`
+- Resistant organisms in microbiology: MRSA, VRE, ESBL, KPC, CRE, MDR
+- Oliguria flag
 
-    # Clinical data
-    "diagnoses": [{"icd_code", "icd_version", "long_title", "seq_num"}],
-    "icu_stays": [{"stay_id", "first_careunit", "last_careunit", "los"}],
-    "medications": [{"drug", "route", "dose_val_rx"}],
-    "lab_flags": [{"label", "flag", "value"}],
-    "procedures": [{"icd_code", "long_title"}],
-    "drgcodes": [{"drg_code", "description", "drg_severity", "drg_mortality"}],
-    "microbiology": [{"specimen", "organism", "resistant_to", "sensitive_to"}],
-    "pharmacy_active": [str],         # drug names active at discharge
-    "pharmacy_stopped": [str],        # drug names stopped during admission
-    "care_trajectory": [str],         # ordered list of care units
-    "icu_procedure_summary": {
-        "ventilation_hours": float,
-        "has_arterial_line": bool,
-        "has_central_line": bool,
-        "has_dialysis": bool,
-        "procedure_names": [str],
-    },
-    "hcpcs_categories": [str],
-    "weight_kg": float | None,
-    "bmi": float | None,
+**Medium:** Everything in between — the most clinically informative tier.
+- 56% home_with_services / 39% home
+- Requires reading actual clinical features to distinguish
 
-    # v3 enrichments
-    "vitals": {
-        "Heart Rate": {"admission_value", "discharge_value", "min_value", "max_value", "critical_flag"},
-        "Systolic BP": {...},
-        ...
-    },
-    "fluid_balance": {
-        "total_input_ml": float,
-        "total_urine_ml": float,
-        "total_output_ml": float,
-        "net_balance_ml": float,      # input - output
-        "fluid_overloaded": bool,     # net_balance > 3000mL
-        "oliguria": bool,             # urine < 400mL/day average
-    },
-    "emar_summary": [{
-        "medication": str,
-        "first_given": str,           # ISO timestamp
-        "last_given": str,
-        "total_doses": int,
-        "active_at_discharge": bool,  # last_given within 24h of dischtime
-    }],
-    "discharge_orders": {
-        "discharge_planning_finalized": bool,
-        "documented_discharge_orders": [str],
-    },
+**Pool sizes (MIMIC-IV demo):**
+- Easy: 21 patients — all plain HOME, constant function, useless for training
+- Medium: 109 patients — real HOME vs HOME_WITH_SERVICES discrimination
+- Hard: 103 patients — complex dispositions (SNF / hospice / expired)
+- Total: 233 patients
 
-    # Derived fields
-    "complexity": "easy" | "medium" | "hard",
-    "noise_level": str,               # set by _apply_noise()
+### Fallback Rule
 
-    # Private (not sent to agent)
-    "_emar_drug_set": Set[str],       # lowercased medication names from eMAR
-}
-```
-
-### Vital Sign Extraction — `_get_vitals(hadm_id)`
-
-Vital items tracked (MIMIC `itemid` mapping):
-```python
-_VITAL_ITEMS = {
-    220045: "Heart Rate",
-    220179: "Systolic BP",
-    220180: "Diastolic BP",
-    220277: "SpO2",
-    223761: "Temperature F",
-    220210: "Respiratory Rate",
-    223900: "GCS Total",
-}
-```
-
-The chartevents table is the largest in MIMIC (~10GB for full dataset, ~50MB for demo). It's loaded with column filters and only rows with `warning == 0` (no data quality alerts) are kept. For each vital sign per admission, the method computes:
-- `admission_value`: median of the first 4 hours of data
-- `discharge_value`: median of the last 4 hours of data
-- `min_value`, `max_value`: over the entire stay
-- `critical_flag`: True if any value exceeded clinical thresholds (HR>150 or <40, SpO2<88, etc.)
-
-### Fluid Balance — `_get_fluid_balance(hadm_id)`
-
-- `total_input_ml`: sum of all `inputevents.amount` where `amountuom` is mL-convertible
-- `total_urine_ml`: sum of `outputevents` where `label` contains "urine" or "foley"
-- `total_output_ml`: sum of all `outputevents.value`
-- `net_balance_ml = total_input_ml - total_output_ml`
-- `fluid_overloaded = net_balance_ml > 3000`
-- `oliguria`: average daily urine output < 400 mL/day (0.5 mL/kg/h threshold converted to daily)
-
-### eMAR Timeline — `_get_emar_summary(hadm_id, dischtime)`
-
-Groups emar rows by medication name, computes first/last given timestamps and dose count. A medication is `active_at_discharge = True` if its `last_given` timestamp is within 24 hours before `dischtime`.
-
-The `_emar_drug_set` private key stores a flat `Set[str]` of lowercased medication names from eMAR. This is used by Task 2 and Task 3 graders as a second source of truth for hallucination detection — a drug flagged as hallucinated must be absent from BOTH prescriptions AND eMAR.
-
-### Discharge Orders — `_get_discharge_orders(hadm_id)`
-
-The `poe` table has no `hadm_id` column in poe_detail — discharge order details require a join:
-```
-poe (subject_id, poe_id, order_type) 
-  → join poe_detail (poe_id, field_name, field_value)
-  → filter order_type == "Discharge Planning"
-```
-`discharge_planning_finalized = True` if the order set contains a finalized discharge planning note.
-
-### Complexity Classification — `classify_complexity(ep)`
-
-A `@staticmethod` that reads the episode dict and assigns a tier:
-
-```
-easy:   discharge_location == HOME (not with services)
-        AND hospital_los_days <= 4
-        AND len(icu_stays) == 0
-        AND len(diagnoses) <= 5
-
-hard:   discharge_location IN {SNF, REHAB, HOSPICE, DIED, ...}
-        OR hospital_los_days > 14
-        OR ventilation_hours > 24
-        OR any drug resistance (MRSA, VRE, ESBL, etc.)
-        OR oliguria == True
-
-medium: everything else
-```
-
-The complexity index `{complexity: [hadm_id, ...]}` is built at init time by calling `classify_complexity` on a lightweight version of each episode, avoiding full extraction overhead.
+If any complexity tier has fewer than 10 unique patients, the environment falls back to sampling from the full 233-patient pool rather than halting.
 
 ---
 
-## 3. Pydantic Schema Layer
+## 3. Observation Space
 
-### File: `environment/models.py`
+Every `/reset` response is an `Observation` object.  All fields are populated from the episode dict built by EpisodeBuilder.
 
-All data crossing the HTTP boundary is validated by Pydantic v2 models. This prevents malformed agent actions from crashing the environment.
+| Field | Type | Description |
+|-------|------|-------------|
+| `hadm_id` | int | Hospital admission ID |
+| `task_id` | int | Active task (1–4) |
+| `age` | int | Patient age at admission |
+| `gender` | str | M / F |
+| `admission_type` | str | EMERGENCY / ELECTIVE / URGENT / OBSERVATION ADMIT |
+| `admission_location` | str | Emergency room / physician referral / transfer |
+| `hospital_los_days` | float | Total hospital length of stay |
+| `complexity` | str | easy / medium / hard |
+| `diagnoses` | list[dict] | ICD code, description, sequence number — capped at 15 total |
+| `pharmacy_active` | list[str] | **Drugs active at discharge — the ONLY valid source for `medications_to_continue`** |
+| `pharmacy_stopped` | list[str] | **Drugs stopped during admission — the ONLY valid source for `medications_to_discontinue`** |
+| `medications` | list[dict] | Full medication orders (drug, route, dose) — reference only |
+| `lab_flags` | list[dict] | Abnormal lab results (name, flag: CRITICAL/HIGH/LOW/ABNORMAL, value) |
+| `procedures` | list[str] | ICD procedure descriptions — capped at 10 |
+| `icu_stays` | list[dict] | ICU unit name + LOS per stay |
+| `icu_procedures` | dict | `ventilation_hours`, `has_dialysis`, `has_arterial_line`, `has_central_line` |
+| `vitals` | list[dict] | HR, BP, SpO2, GCS Total, Temp — admission → discharge values |
+| `drg_codes` | list[dict] | DRG code, description, severity_score (1–4), mortality_score (1–4) |
+| `microbiology` | list[dict] | Culture organisms with susceptibility data |
+| `fluid_balance` | dict | `net_balance_ml`, `fluid_overloaded` (bool), `oliguria` (bool) |
+| `care_trajectory` | list[str] | Ordered care unit path (ED → MICU → floor) |
+| `emar_summary` | list[dict] | Medication admin records with `active_at_discharge` flag |
+| `discharge_orders` | dict | `discharge_planning_finalized` (bool), order types |
 
-### Observation
+**Critical fields for grading:**
+- `pharmacy_active` — only valid medication source for Tasks 2/3/4
+- `vitals.GCS Total` — key end-of-life indicator for Task 1
+- `diagnoses[*].icd_code` — specialty derivation for Task 2
+- `drg_codes[*].mortality_score` — hospice trigger (score = 4) for Task 1
+- `microbiology` — Infectious Disease specialty trigger for Task 2
 
-Returned by `reset()` and by `step()` when `done=False`:
+### Task 2 Information Gating
 
-```python
-class Observation(BaseModel):
-    task_id:    int
-    subject_id: int
-    hadm_id:    int
-    step_num:   int          # 0-indexed at reset, increments each step
-    max_steps:  int          # 1 for Task 1/3, 4 for Task 2, 10 for Task 4
+Task 2 starts with only: `demographics`, `admission_type`, `hospital_los_days`, `complexity`, and **top 5 diagnoses only** (not all 15).
 
-    # Always visible
-    age, gender, admission_type, admission_location, insurance, language
-    hospital_los_days: float
-    complexity: str          # "easy" | "medium" | "hard"
-    noise_level: str         # "clean" | "partial" | "noisy"
+The agent must request additional fields before submitting:
 
-    # Clinical data (may be gated for Tasks 2/4)
-    diagnoses:       List[DiagnosisInfo]
-    icu_stays:       List[ICUStay]
-    medications:     List[Medication]
-    lab_flags:       List[LabFlag]
-    procedures:      List[str]
-    drg_codes:       List[str]
-    microbiology:    List[MicrobiologyResult]
-    icu_procedures:  ICUProcedureSummary
-    care_trajectory: List[str]
-    weight_kg, bmi:  Optional[float]
-    pharmacy_active, pharmacy_stopped, hcpcs_categories: List[str]
-
-    # v3 enrichments (may be gated)
-    vitals:           List[VitalSign]
-    fluid_balance:    Optional[FluidBalance]
-    emar_summary:     List[EmarMedication]
-    discharge_orders: Optional[DischargeOrders]
-
-    # Task 4 only: prior step memory
-    episode_history: List[Dict[str, Any]]  # [{step_num, action_summary, reward}]
-
-    task_description:         str
-    action_space_description: str
+```json
+{"task_id": 2, "information_request": ["labs", "medications", "microbiology"]}
 ```
 
-### Action
+Requestable fields: `labs` · `vitals` · `medications` · `microbiology` · `fluid_balance`
 
-Sent by agent to `POST /step`:
+After request, the full versions of those fields unlock in the observation.
 
-```python
-class Action(BaseModel):
-    task_id: int
-    task1:   Optional[Task1Action]   # {"disposition": str, "reasoning": str}
-    task2:   Optional[Task2Action]   # care plan fields
-    task3:   Optional[Task3Action]   # {"discharge_note": str}
-    task4:   Optional[Task4Action]   # all 10 step fields (all optional)
-    information_request: Optional[List[str]]  # Task 2 gating requests
-```
+### Task 4 Progressive Revelation
 
-### Task4Action — unified multi-step action
+Task 4 reveals EHR fields by step number, simulating real-time ICU data arrival:
 
-All fields optional; each step submission fills in only the relevant subset:
-
-```python
-class Task4Action(BaseModel):
-    # Step 1
-    triage_level: Optional[str]            # "icu"|"stepdown"|"floor"
-    # Step 2
-    priority_labs: Optional[List[str]]
-    priority_consults: Optional[List[str]]
-    # Step 3
-    interventions: Optional[List[str]]
-    # Step 4
-    high_risk_medications: Optional[List[str]]
-    # Step 5
-    antibiotic_strategy: Optional[str]    # "none"|"targeted"|"broad"|"empiric"
-    antibiotics: Optional[List[str]]
-    # Step 6
-    fluid_strategy: Optional[str]         # "restrict_diuresis"|"aggressive_resuscitation"|"maintain"
-    # Step 7
-    ready_for_stepdown: Optional[bool]
-    barriers: Optional[List[str]]
-    # Step 8
-    predicted_disposition: Optional[str]
-    los_remaining_days: Optional[float]
-    # Step 9
-    medications_to_continue: Optional[List[str]]
-    # Step 10
-    final_note: Optional[str]
-    # Revision mechanism
-    revise_step: Optional[int]            # 1-9
-    revision: Optional[Dict[str, Any]]   # corrected fields for that step
-```
-
-### StepResult
-
-Returned by every `step()` call:
-
-```python
-class StepResult(BaseModel):
-    observation:     Optional[Observation]   # None when done=True
-    reward:          float                   # 0.0–1.0
-    done:            bool
-    info:            Dict[str, Any]          # grader-specific debug info
-    partial_signals: Dict[str, float]        # per-component scores
-```
+| Unlocks at step | Fields |
+|----------------|--------|
+| 1 | Demographics, admission_type, LOS, complexity, diagnoses, DRG codes |
+| 2 | `lab_flags` |
+| 3 | `vitals`, `icu_procedures` |
+| 4 | `medications`, `emar_summary` |
+| 5 | `microbiology` |
+| 6 | `fluid_balance` |
+| 7 | `care_trajectory` |
+| 8 | `discharge_orders` |
 
 ---
 
 ## 4. Environment Core — MIMICDischargeEnv
 
-### File: `environment/env.py`
+**File:** `environment/env.py`
 
-The environment is a single-instance stateful object. In the server, one instance is shared across all HTTP requests (single-process, no locking — intended for single-agent use).
-
-### State Variables
+### reset()
 
 ```python
-self._episode:           Dict       # raw episode dict from EpisodeBuilder
-self._task_id:           int
-self._step_num:          int        # 0 at reset, increments in step()
-self._cumulative_reward: float
-self._last_reward:       float
-self._total_episodes:    int
-self.active:             bool
-self._revealed_info:     Set[str]   # Task 2: which info categories revealed
-self._noise_level:       str
-self._shaping_log:       Dict       # Task 4: per-step scores and metadata
-self._episode_history:   List[Dict] # Task 4: prior step summaries for obs
+def reset(
+    task_id: int = 1,
+    hadm_id: Optional[int] = None,
+    noise_level: str = "clean",
+    curriculum_mode: str = "random",
+) -> Observation
 ```
 
-### `reset()` Flow
+- Clamps `task_id` to [1, 4]
+- If `hadm_id` is not provided, samples from the appropriate complexity pool based on `curriculum_mode`
+- Resets internal state: `_step_num = 0`, `_cumulative_reward = 0.0`, `_shaping_log = {}`, `_revealed_info`
+- Initializes Task 2 revealed fields to the default initial set
+- Calls `EpisodeBuilder.get_episode(hadm_id, noise_level)` → applies noise masking → returns Observation
 
-```
-reset(task_id, hadm_id=None, noise_level="clean", curriculum_mode="random")
-  │
-  ├─ Clamp task_id to [1, 4]
-  ├─ Sample hadm_id if None using _sample_hadm_id(curriculum_mode)
-  ├─ builder.get_episode(hadm_id, noise_level) → raw episode dict
-  ├─ Zero all step state (_step_num, _cumulative_reward, etc.)
-  ├─ Reset _revealed_info to _TASK2_INITIAL (demographics + los + complexity)
-  ├─ Reset _shaping_log = {}
-  ├─ Reset _episode_history = []
-  └─ _build_observation() → Observation
-```
+**Curriculum modes:**
+- `easy_only` — sample from easy tier (21 patients)
+- `medium_only` — sample from medium tier (109 patients)
+- `hard_only` — sample from hard tier (103 patients)
+- `random` — sample from all 233 patients
+- `progressive` — episodes 0–199: easy, 200–499: medium, 500+: random
 
-### `step()` Dispatch
-
-```
-step(action: Action)
-  │
-  ├─ Increment _step_num
-  ├─ Read cfg = TASK_CONFIG[_task_id]
-  │
-  ├─ Task 2 branch:
-  │   ├─ If action.information_request → reveal categories, return obs (reward=0, done=False)
-  │   ├─ If action.task2 → grade, apply discount, done=True
-  │   └─ If neither → hint or timeout
-  │
-  ├─ Task 4 branch:
-  │   ├─ grade(action, episode, step_num, _shaping_log) → (reward=0 for steps 1-9)
-  │   ├─ Append to _episode_history
-  │   └─ Return StepResult (done=False until step 10)
-  │
-  └─ Tasks 1/3 branch:
-      ├─ grade(action, episode) → (reward, partial, done_grader, info)
-      └─ Apply excess step penalty if step_num > max_steps
-```
-
-### `_build_observation()` — Gating Logic
-
-The key function that constructs the `Observation` Pydantic model from the raw episode dict. It applies field gating based on task:
+### step()
 
 ```python
-_T4_THRESHOLDS = {
-    "labs": 2, "vitals": 3, "icu_procedures": 3, "medications": 4,
-    "emar": 4, "microbiology": 5, "fluid_balance": 6,
-    "care_trajectory": 7, "discharge_orders": 8,
-}
-
-def _gate(category, value, default):
-    if task2:
-        return value if category in self._revealed_info else default
-    if task4:
-        return value if self._step_num >= _T4_THRESHOLDS.get(category, 0) else default
-    return value  # Tasks 1 and 3: no gating
+def step(action: Action) -> StepResult
 ```
 
-For Tasks 1 and 3, the full observation is returned immediately. For Task 2, fields are hidden until the agent explicitly requests them. For Task 4, fields are revealed automatically as the step counter advances — mimicking how a physician progressively orders tests and consults over the course of an admission.
+Returns `StepResult` = `(observation, reward, done, partial_signals, info)`
 
----
+**Task 1 / Task 3:** Single-step. Grade immediately. `done = True`. Extra steps beyond `max_steps` incur a -0.10/step penalty.
 
-## 5. Task 1 — Discharge Disposition (Easy)
+**Task 2:**
+1. If `action.information_request` is set → update `_revealed_info`, return updated Observation with `reward=0, done=False`
+2. If `action.task2` is set → grade via `CarePlanGrader`, apply step efficiency discount, return `done=True`
 
-### File: `environment/tasks/task1_disposition.py`
+**Task 4:**
+1. Steps 1–9 → dispatch to step-specific grader, store score in `_shaping_log[step_num]`, return `reward=0, done=False`
+2. Revision handling: if `action.revise_step` + `action.revision` set and revisions_used < 2 → re-grade that step, update `_shaping_log`, return `reward=0` (no-op, costs a step)
+3. Step 10 → grade final note, compute composite reward: `0.60 × note + 0.40 × shaping_avg + bonuses − revision_cost`, return `done=True`
 
-**Single-step, full observation.** The agent sees the complete patient record and must pick one of 8 canonical dispositions.
-
-### Scoring
-
-```
-score = 1.0  if exact canonical match
-      = 0.5  if same broad group (community / facility / end_of_life)
-      = 0.25 if clinically adjacent (e.g., snf ↔ home_with_services)
-      = 0.0  otherwise
-      + 0.05 reasoning bonus (if ≥20 chars and contains clinical keyword or number)
-```
-
-### `normalize_mimic_location(location)` — Ground Truth Canonicalization
-
-MIMIC stores free-text discharge locations like "HOME HEALTH CARE", "SKILLED NURSING FACILITY", "DIED". This function maps them to the 8 canonical categories via ordered substring matching (more specific patterns checked first to avoid "HOME" matching "HOME HEALTH CARE").
-
-### Broad Group Adjacency
+### TASK_CONFIG
 
 ```python
-BROAD_GROUP = {
-    "home":               "community",
-    "home_with_services": "community_plus",
-    "ama":                "community",
-    "snf":                "facility",
-    "rehab":              "facility",
-    "hospice":            "end_of_life",
-    "expired":            "end_of_life",
-    "other":              "other",
+TASK_CONFIG = {
+    1: {"max_steps": 1},
+    2: {"max_steps": 4, "step_efficiency_discount": {1: 1.0, 2: 1.0, 3: 0.85, 4: 0.70}},
+    3: {"max_steps": 1},
+    4: {"max_steps": 10},
 }
 ```
 
-Adjacent pairs (clinically close but wrong): `home ↔ home_with_services`, `snf ↔ rehab`, `hospice ↔ snf`, `expired ↔ hospice`.
-
-### Fuzzy Prediction Matching
-
-The agent's prediction string is normalized before comparison: hyphens replaced with underscores, common aliases resolved (`"skilled_nursing"` → `"snf"`, `"rehabilitation"` → `"rehab"`, etc.).
-
 ---
 
-## 6. Task 2 — Care Plan Recommendation (Medium)
+## 5. Task 1 — Discharge Disposition
 
-### File: `environment/tasks/task2_careplan.py`
+**File:** `environment/tasks/task1_disposition.py`  
+**Difficulty:** Easy · 1 step · All EHR fields visible
 
-**Multi-step with 4-step information revelation protocol.** The agent starts with limited data and must request additional categories before submitting a care plan.
+### Action Format
 
-### 4-Step Protocol
-
-```
-Step 0 (reset):  Always visible: demographics, top 5 diagnoses, LOS, complexity
-Steps 1-3:       information_request → unlock one or more of:
-                   "labs" | "vitals" | "medications" | "microbiology" | "fluid_balance"
-Final step:      Submit task2 care plan → receive graded reward
-```
-
-The agent can submit the care plan at any step (step 1 through 4), trading off information quality against the step efficiency multiplier.
-
-### Step Efficiency Multiplier
-
-```python
-{1: 1.0, 2: 1.0, 3: 0.85, 4: 0.70}
+```json
+{
+  "task_id": 1,
+  "task1": {
+    "disposition": "home_with_services",
+    "reasoning": "Patient requires IV antibiotics and wound care post-op."
+  }
+}
 ```
 
-Optimal strategy: 1 information request + 1 care plan submission = 2 steps = 1.0× multiplier.
+### Valid Disposition Values
+
+| Value | Clinical Meaning |
+|-------|-----------------|
+| `home` | Fully independent, no professional follow-up needed |
+| `home_with_services` | Visiting nurse, home PT, IV antibiotics, wound care |
+| `snf` | Skilled nursing facility — 24h nursing + ongoing medical needs |
+| `rehab` | Inpatient rehabilitation — intensive PT/OT, medically stable |
+| `hospice` | Terminal prognosis, comfort-focused care only |
+| `ama` | Left against medical advice |
+| `expired` | Patient died during this admission |
+| `other` | Transfer to acute hospital or psychiatric unit |
 
 ### Scoring Formula
 
 ```
-raw = 0.35 × specialty_F1
-    + 0.25 × medication_F1
-    + 0.25 × instruction_quality
-    + 0.15 × discontinue_accuracy
-    − hallucination_penalty (max 0.10)
-    − ghost_specialty_penalty (max 0.10)
-
-final = raw × step_efficiency_discount
+score = tier_score + reasoning_bonus
+      = [1.0 | 0.50 | 0.25 | 0.0] + [0 or 0.05]
+      clamped to [0.0, 1.0]
 ```
 
-### Specialty F1 — Ground Truth Generation
+**Tier scoring:**
 
-Expected follow-up specialties are derived programmatically from the episode:
-1. **ICD prefix mapping**: ICD code prefixes → specialty (e.g., `I*` → cardiology, `N18*` → nephrology)
-2. **Microbiology**: any positive culture → infectious disease
-3. **HCPCS categories**: e.g., cardiac HCPCS codes → cardiology
+| Match level | Score |
+|------------|-------|
+| Exact canonical match | 1.00 |
+| Same broad group | 0.50 |
+| Clinically adjacent | 0.25 |
+| No match | 0.00 |
 
-This produces a set of expected specialties. The agent's `follow_up_specialties` list is matched using token-stem fuzzy matching (e.g., "Cardiology" matches "cardiology", "Cardiac Surgery" also matches via substring).
+**Broad groups:**
 
-### Medication F1
+| Group | Members |
+|-------|---------|
+| `community` | home, ama |
+| `community_plus` | home_with_services |
+| `facility` | snf, rehab |
+| `end_of_life` | hospice, expired |
+| `other` | other |
 
-Expected medications = active pharmacy + top eMAR medications at discharge.
+**Adjacency table:**
 
-Drug names are stem-matched using `_med_stem(drug)`: take the first token of at least 4 characters. For example, "metoprolol succinate 25mg" → stem "meto". This tolerates brand/generic differences.
+| Predicted | Adjacent to |
+|-----------|-------------|
+| home | home_with_services, ama |
+| home_with_services | home, snf |
+| snf | home_with_services, rehab, other |
+| rehab | snf, other |
+| hospice | snf, home_with_services, expired |
+| expired | hospice |
+| ama | home |
+| other | snf, rehab |
 
-```
-F1 = 2 × precision × recall / (precision + recall)
-```
+### Reasoning Bonus (+0.05)
 
-Where:
-- `precision` = fraction of recommended drugs that are in the true medication set
-- `recall` = fraction of true discharge meds mentioned by the agent
+Awarded when reasoning string:
+- Is ≥ 20 characters, AND any of:
+  - Contains ≥1 clinical keyword (functional, ambulation, therapy, nursing, icu, cardiac, creatinine, ejection fraction, renal, ventil, dialysis, fracture, wound, infection, malignant, hospice, terminal, palliative…)
+  - Contains a number and is > 30 chars
+  - Contains "icd", "dx", "diagnosis", "condition", or "history"
+  - Is ≥ 50 chars (fallback)
 
-A drug recommended by the agent is NOT a false positive if it appears in either `prescriptions` OR `emar_summary` (dual-source check introduced in v3). This prevents penalising agents who correctly identify drugs from eMAR that weren't in the prescription table.
+### MIMIC Discharge Location Normalization
 
-### Ghost Specialty Penalty
+The grader normalizes raw MIMIC discharge_location strings to canonical values using ordered pattern matching:
 
-Penalises specialties the agent recommends when there's no clinical evidence for them:
-
-```python
-_SPECIALTY_ICD_PREFIXES = {
-    "cardiology": ["I", "42", "41", "V45"],
-    "nephrology": ["N18", "N17", "585"],
-    "pulmonology": ["J", "496", "491"],
-    ...
-}
-```
-
-A specialty is a "ghost" if none of the patient's ICD codes map to that specialty's prefix list. Ghost penalty = min(0.10, 0.04 × ghost_count).
-
-### Instruction Quality
-
-Evaluated using a keyword density approach on the `key_instructions` list:
-- Specific thresholds ("call if weight gain > 2 lbs") score higher than vague instructions ("monitor weight")
-- Medical condition keywords, numeric values, and action verbs all contribute
-- Duplicate instructions (high sentence overlap) are penalised
-
-### Discontinue Accuracy
-
-Cross-checks `medications_to_discontinue` against `pharmacy_stopped` (drugs actually stopped before discharge). F1 between the agent's discontinue list and the true stopped list.
+| Canonical | MIMIC strings matched (order matters) |
+|-----------|---------------------------------------|
+| `home_with_services` | HOME HEALTH CARE, HOME HEALTH, HOME WITH SERVICE, HOME WITH AIDE, HOME WITH VNA, ASSISTED LIVING |
+| `snf` | SKILLED NURSING FACILITY, SNF, LONG TERM CARE, CHRONIC CARE, EXTENDED CARE, NURSING HOME, SUB-ACUTE |
+| `rehab` | REHABILITATION, REHAB FACILITY, INPATIENT REHAB |
+| `hospice` | HOSPICE-MEDICAL FACILITY, HOSPICE-HOME, COMFORT CARE ONLY |
+| `ama` | AGAINST MEDICAL ADVICE, LEFT AMA, ELOPED |
+| `expired` | DIED IN ICU, DIED, EXPIRED, DECEASED |
+| `other` | ACUTE HOSPITAL, TRANSFER, PSYCH FACILITY, CORRECTIONAL, GROUP HOME |
+| `home` | DISCHARGED TO HOME, RETURNED HOME, HOME, SELF |
 
 ---
 
-## 7. Task 3 — Discharge Note Generation (Hard)
+## 6. Task 2 — Care Plan Recommendation
 
-### File: `environment/tasks/task3_note.py`
+**File:** `environment/tasks/task2_careplan.py`  
+**Difficulty:** Medium · ≤4 steps (gated) · Efficiency-discounted
 
-**Single-step, full observation, free-text output.** The agent generates a complete clinical discharge summary (≥300 words) that is scored against structured MIMIC fields.
+### Action Format (submission step)
+
+```json
+{
+  "task_id": 2,
+  "task2": {
+    "follow_up_specialties": ["Cardiology", "Nephrology"],
+    "medications_to_continue": ["Lisinopril 10mg", "Metoprolol 25mg"],
+    "medications_to_discontinue": ["Heparin drip"],
+    "key_instructions": [
+      "Weigh daily; call if weight increases > 2 lbs in 24 hours",
+      "Take lisinopril at the same time each morning",
+      "Call 911 if chest pain or shortness of breath",
+      "Follow low-sodium diet < 2g/day",
+      "Follow-up with cardiology within 1 week"
+    ]
+  }
+}
+```
+
+### Scoring Formula
+
+```
+raw = 0.35 × specialty_f1
+    + 0.25 × medication_f1
+    + 0.25 × instruction_quality
+    + 0.15 × discontinue_accuracy
+    − hallucination_penalty   (max 0.10)
+    − ghost_specialty_penalty (max 0.10)
+
+final = max(0.0, min(1.0, raw)) × step_efficiency_discount
+```
+
+**Step efficiency discount:**
+
+| Steps used | Multiplier |
+|-----------|-----------|
+| 1–2 | 1.00× |
+| 3 | 0.85× |
+| 4+ | 0.70× |
+
+**Optimal strategy:** `information_request: ["labs", "medications", "microbiology"]` on step 1 → submit care plan on step 2.
+
+### ICD → Specialty Mappings
+
+**ICD-10 (first letter):**
+
+| Prefix | Specialty |
+|--------|-----------|
+| A, B | Infectious Disease |
+| C | Oncology |
+| D | Hematology, Oncology |
+| E | Endocrinology |
+| F | Psychiatry |
+| G | Neurology |
+| H | Ophthalmology |
+| I | Cardiology |
+| J | Pulmonology |
+| K | Gastroenterology |
+| L | Dermatology |
+| M | Rheumatology |
+| N | Nephrology |
+| O | Obstetrics |
+| Q | Genetics |
+| S | Trauma Surgery |
+| T | Toxicology |
+
+**ICD-9 (numeric range):**
+
+| Range | Specialty |
+|-------|-----------|
+| 001–139 | Infectious Disease |
+| 140–239 | Oncology |
+| 240–279 | Endocrinology |
+| 290–319 | Psychiatry |
+| 320–389 | Neurology |
+| 390–459 | Cardiology |
+| 460–519 | Pulmonology |
+| 520–579 | Gastroenterology |
+| 580–629 | Nephrology |
+| 630–677 | Obstetrics |
+| 680–709 | Dermatology |
+| 710–739 | Rheumatology |
+| 800–999 | Trauma Surgery |
+
+**Microbiology → Specialty:**  
+Any of `staphylococcus`, `streptococcus`, `klebsiella`, `pseudomonas`, `escherichia`, `candida`, `aspergillus`, `enterococcus`, `mrsa`, `vre`, `clostridioid` → **Infectious Disease**
+
+**HCPCS procedure keywords:** `cardiovascular/cardiac` → Cardiology · `pulmonary/respiratory` → Pulmonology · `dialysis/renal` → Nephrology · `oncol/chemo` → Oncology · `endoscop/colono` → Gastroenterology · `orthop/joint` → Orthopedics
+
+### Specialty F1
+
+- Fuzzy word-overlap matching between predicted and expected specialty sets
+- Predictions capped at 8 specialties
+- If expected set is empty → returns (1.0, 1.0, 1.0)
+- `recall = matched_expected / len(expected)`
+- `precision = matched_pred / len(predicted)`
+- `f1 = 2 × recall × precision / (recall + precision)`
+
+### Ghost Specialty Penalty
+
+Fires when a predicted specialty has no supporting ICD code in the patient record.
+
+- Penalty: `min(0.10, len(ghosts) × 0.05)` — max 2 unsupported specialties = full 0.10 penalty
+- Skipped for: "primary care", "general medicine", "hospitalist"
+- Bypass: if ANY abnormal lab flag exists, general medical specialties get a pass
+
+### Medication F1 and Hallucination
+
+Drug stem extraction: first token ≥4 chars, else first 4 chars of the drug name.
+
+- Known sources: `prescriptions` + `pharmacy_active` + `emar_summary`
+- Drug is hallucinated ONLY if absent from **all** sources
+- Recall computed against top 5 drugs from episode
+- `hallucination_penalty = min(0.10, halluc_rate × 0.10)`
+
+### Instruction Quality Score
+
+Filters and scores up to 10 instructions across 6 clinical categories:
+
+| Category | Trigger keywords | Quality keywords |
+|----------|-----------------|-----------------|
+| activity | activity, exercise, walk, mobilize | daily, week, minute, miles, steps |
+| diet | diet, sodium, fluid, calorie, protein | gram, mg, litre, low, restrict, avoid |
+| medication | medication, medicine, drug, take, dose | daily, twice, morning, mg, tablet |
+| follow_up | follow, appointment, return, clinic, call | week, day, month, doctor, specialist |
+| warnings | call, emergency, warning, seek, if | chest, breath, pain, fever, bleeding |
+
+`score = categories_hit / 6 + unique_bonus` where `unique_bonus = min(0.1, len(instructions) / 50)`
+
+---
+
+## 7. Task 3 — Discharge Note Generation
+
+**File:** `environment/tasks/task3_note.py`  
+**Difficulty:** Hard · 1 step · Full EHR visible · Min 300 words
+
+### Action Format
+
+```json
+{
+  "task_id": 3,
+  "task3": {
+    "discharge_note": "PRINCIPAL DIAGNOSIS:\n1. Nonrheumatic aortic valve stenosis...\n\nBRIEF HOSPITAL COURSE:\nThe patient was admitted for 12.8 days...\n\n[7 required sections]"
+  }
+}
+```
+
+### Required Sections (in order)
+
+1. PRINCIPAL DIAGNOSIS
+2. BRIEF HOSPITAL COURSE *(must state LOS in days numerically, e.g. "admitted for 12.8 days")*
+3. KEY PROCEDURES PERFORMED
+4. DISCHARGE CONDITION
+5. DISCHARGE DISPOSITION *(must use one of 6 exact canonical phrases)*
+6. DISCHARGE MEDICATIONS *(exact drug names from `pharmacy_active` only)*
+7. FOLLOW-UP INSTRUCTIONS
+
+**Required disposition phrases (verbatim):**
+
+| Disposition | Required phrase |
+|-------------|----------------|
+| home | "The patient was discharged home." |
+| home_with_services | "The patient was discharged home with home health services." |
+| snf | "The patient was transferred to a skilled nursing facility." |
+| rehab | "The patient was transferred to inpatient rehabilitation." |
+| hospice | "The patient was transitioned to hospice care." |
+| expired | "The patient expired during this hospitalization." |
 
 ### Scoring Formula
 
 ```
 raw = 0.30 × diagnosis_coverage
     + 0.20 × disposition_accuracy
-    + 0.20 × medication_F1
-    + 0.15 × LOS_accuracy
+    + 0.20 × medication_f1
+    + 0.15 × los_accuracy
     + 0.10 × structure_score
     + 0.05 × information_density
-    − hallucination_penalty (max 0.15)
-    − followup_structure_penalty (0.05)
 
-final = max(0.0, min(1.0, raw))
+halluc_penalty   = min(0.15, hallucination_rate × 0.15)
+followup_penalty = 0.05  (if discharge_planning_finalized=True but no follow-up section)
+
+final = max(0.0, raw − halluc_penalty − followup_penalty)
 ```
 
-### Diagnosis Coverage — Anti-Stuffing Logic
+### 1. Diagnosis Coverage (0.30)
 
-For each of the top 5 diagnoses, extract keywords (≥5 chars, not stopwords) from the ICD long title. A diagnosis is "covered" if at least one sentence of ≥5 words contains any of its keywords.
+- Top 5 diagnoses extracted from `long_title`
+- Keywords: words ≥5 chars, excluding 17 clinical stopwords (`unspecified`, `without`, `chronic`, `acute`, `disease`, `disorder`, etc.)
+- Up to 4 keywords per diagnosis
+- Sentence must be ≥5 words to count
+- **Anti-stuffing:** keyword density > 0.08 → coverage halved
+- **Anti-catch-all:** sentence matching ≥3 diagnoses simultaneously → discarded (vague)
 
-**Anti-stuffing rule**: A single sentence that matches ≥3 different diagnoses simultaneously is treated as having zero coverage (indicates vague generic statements like "patient with multiple comorbidities including...").
+### 2. Disposition Accuracy (0.20)
 
-**Keyword density guard**: If >8% of all note words are diagnosis keywords, the coverage score is halved (detects keyword-stuffed notes that repeat medical terms without forming coherent sentences).
+- 1.0 → synonym for true disposition present in note
+- 0.3 → generic "discharg" keyword present (note mentions discharge but no specific location)
+- 0.0 → no match
 
-### Medication F1 with Hallucination Detection
+### 3. Medication F1 (0.20)
 
-Two passes:
-1. **True positives**: drug stems from the episode's prescription list that appear in the note
-2. **False positives**: tokens matching drug suffix patterns (`-olol`, `-pril`, `-statin`, `-mycin`, etc.) or following medication context phrases ("prescribed X", "given X") that don't match ANY known drug (from both prescriptions AND eMAR)
+- Drug suffix regex detects 40+ suffixes: `mab`, `nib`, `pril`, `sartan`, `olol`, `statin`, `mycin`, `cillin`, `oxacin`, `cycline`, `azole`, `prazole`, etc.
+- Context regex also matches: "medication X", "dose of X", "prescribed X"
+- True positives: detected drugs matching `prescriptions`
+- False positives: detected drugs NOT in `prescriptions` OR `emar_summary`
+- `hallucination_rate = fp / (tp + fp)` → penalty = `min(0.15, rate × 0.15)`
 
-`hallucination_rate = len(false_positives) / (len(true_positives) + len(false_positives))`
-`hallucination_penalty = min(0.15, hallucination_rate × 0.15)`
+### 4. LOS Accuracy (0.15)
 
-### LOS Accuracy
+- Tolerance = `max(1, round(LOS × 0.25))` days
+- 1.0 → LOS number within tolerance of actual
+- 0.3 → note mentions LOS-related keyword ("days", "hospital stay", "admitted for") without valid number
+- 0.0 → no LOS reference
 
-The note must:
-1. Contain at least one LOS context keyword ("day", "days", "hospital stay", "admitted for", etc.)
-2. Mention a number within ±25% (or ±1 day, whichever is larger) of the actual LOS
+### 5. Structure Score (0.10)
 
-If the note mentions LOS context but the number is wrong: 0.3. No LOS context at all: 0.0.
+6 required section types, each detected by keyword patterns:
 
-### Structure Score
-
-Checks 6 required sections by scanning sentences of ≥5 words for trigger phrases:
-```python
-_REQUIRED_SECTIONS = [
-    ("diagnosis",   ["diagnosis", "diagnos", "presenting", "chief complaint"]),
-    ("course",      ["hospital course", "clinical course", "during admission"]),
-    ("medications", ["medication", "medicines", "prescri", "discharge med"]),
-    ("disposition", ["discharg", "disposition", "home", "facility"]),
-    ("followup",    ["follow", "appointment", "clinic", "outpatient"]),
-    ("warnings",    ["call", "return to", "emergency", "warning symptoms"]),
-]
+```
+word_count < 100 → score = 0.0
+base = sections_present / 6
+length_factor = min(1.0, log₂(word_count / 100) / log₂(5))
+score = 0.70 × base + 0.30 × length_factor
 ```
 
-`structure_score = 0.70 × (sections_present/6) + 0.30 × length_factor`
+### 6. Information Density (0.05)
 
-Where `length_factor = min(1.0, log2(words/100) / log2(5))` — a note needs ~500 words for full length credit.
+Type-Token Ratio computed in 100-word sliding windows, penalized for repeated sentences (≥70% word overlap):
 
-### Information Density
-
-Uses Type-Token Ratio (TTR) in sliding 100-word windows to measure lexical diversity. A high-quality note uses varied vocabulary; keyword stuffing produces artificially low TTR.
-
-Also penalises duplicate sentences: sentence pairs with ≥70% Jaccard overlap are counted as duplicates.
-
-`density = mean_ttr - duplicate_pair_rate`
-Normalised to [0, 1] range: `(density - 0.30) / 0.45`
-
-### Follow-Up Structure Penalty (v3)
-
-If `discharge_orders.discharge_planning_finalized == True` (the doctor marked discharge planning complete) but the note doesn't contain "follow-up" or "follow up", subtract 0.05. This ensures agents don't skip the follow-up section when the clinical record indicates planning was completed.
+```
+density = mean_ttr − duplicate_ratio
+score = min(1.0, max(0.0, (density − 0.30) / 0.45))
+```
 
 ---
 
-## 8. Task 4 — Long-Horizon Workflow (Very Hard)
+## 8. Task 4 — ICU Admission-to-Discharge Workflow
 
-### File: `environment/tasks/task4_workflow.py`
+**File:** `environment/tasks/task4_workflow.py`  
+**Difficulty:** Very Hard · 10 steps · Sparse reward (step 10 only) · Hard patients only
 
-**10 sequential steps, sparse reward.** Steps 1-9 return `reward=0.0` but record shaping scores internally. Only Step 10 (the final discharge note) returns a non-zero reward that combines the note quality with how well the agent performed across all prior steps.
+### Sparse Reward Architecture
 
-### Why Sparse Reward for GRPO?
+Steps 1–9 return `reward = 0`.  Each step's score is stored in `_shaping_log`.  Step 10 combines all of them into a single composite reward.
 
-GRPO (Group Relative Policy Optimization) works by comparing multiple rollouts of the same prompt to compute relative advantage. With dense rewards, the policy receives gradient signal at every step — but this can cause the model to optimize intermediate steps in isolation rather than learning coherent long-horizon strategy.
+The agent sees progressively revealed EHR data (see §3) — it doesn't have full information until step 8+.
 
-With sparse reward at Step 10 only, the GRPO gradient is assigned entirely to the final note generation, but the note's score incorporates a weighted average of all prior step scores (the `shaping_avg` term). This means the model must learn that good early decisions (correct triage, appropriate antibiotic selection, accurate medication reconciliation) causally improve the final note score.
-
-### Per-Step Graders
+### Step-by-Step Breakdown
 
 #### Step 1 — Acuity Triage (max 0.10)
 
-Maps the patient's first ICU care unit to a tier and checks if the agent agrees:
+```json
+{"task_id": 4, "task4": {"triage_level": "icu"}}
 ```
-"Medical Intensive Care Unit (MICU)" → "icu"
-"Stepdown Unit" → "stepdown"
-"Medical Ward" → "floor"
+
+Valid levels: `icu` | `stepdown` | `floor`
+
+Classification logic from `care_trajectory` and ICU stay data:
+- ICU keywords: micu, sicu, ccu, cvicu, tsicu, neuro icu, burn icu, cardiac vascular, trauma sicu
+- Stepdown keywords: stepdown, step-down, msicu, intermediate, imu, progressive care
+
+Scoring:
+- Exact match → 1.0 × 0.10
+- ICU/stepdown confusion → 0.5 × 0.10
+- Floor/stepdown confusion → 0.5 × 0.10
+- Wrong → 0.0
+
+#### Step 2 — Priority Labs + Specialist Consults (max 0.15)
+
+```json
+{"task_id": 4, "task4": {
+  "priority_labs": ["CBC", "BMP", "LFTs"],
+  "priority_consults": ["Cardiology", "Nephrology"]
+}}
 ```
-Exact match: 1.0. Adjacent (icu↔stepdown): 0.5. Wrong by 2 tiers: 0.0.
 
-#### Step 2 — Priority Labs + Consults (max 0.15)
+Lab categories scored (from `lab_flags` with CRITICAL/HIGH/LOW/ABNORMAL):
+- renal: creatinine, BUN, potassium, sodium
+- cardiac: troponin, BNP, pro-BNP
+- hepatic: AST, ALT, bilirubin, albumin
+- hematology: hemoglobin, platelet, INR
+- infection: WBC, lactate, procalcitonin
+- metabolic: glucose, calcium, phosphorus, magnesium
 
-**Labs**: Checks which lab flag categories (renal, cardiac, hepatic, hematology, infection, metabolic) have abnormal results in the episode. Scores the agent's `priority_labs` list against the expected categories.
+Consult specialties derived same way as Task 2 (ICD-10/ICD-9 prefix mapping).
 
-**Consults**: Maps ICD codes to expected follow-up specialties using prefix tables (same logic as Task 2 ghost specialty check). Scores the agent's `priority_consults` list using substring matching against expected specialties.
-
-`combined = (lab_score × 0.5) + (spec_score × 0.5)`
-
-Step 2 also stores `step2_expected_specialties` in the shaping log — used at Step 10 for the trajectory bonus.
+```
+lab_score  = hits / expected_labs   (0.8 if no expected labs)
+spec_score = hits / expected_specs  (0.8 if no expected specs)
+score = (0.5 × lab_score + 0.5 × spec_score) × 0.15
+```
 
 #### Step 3 — Interventions (max 0.15)
 
-Checks which interventions are actually needed based on `icu_procedure_summary` and `fluid_balance`:
-- `ventilation_hours > 0` → needs "intubation"/"mechanical ventilation"
-- `has_arterial_line` → needs "arterial line"/"a-line"
-- `has_dialysis` → needs "dialysis"/"crrt"
-- `fluid_overloaded` → needs "fluid bolus"/"resuscitation"
+```json
+{"task_id": 4, "task4": {
+  "interventions": ["intubation", "mechanical ventilation", "arterial line"]
+}}
+```
 
-Scores the agent's `interventions` list against what's actually needed (recall-oriented: credit for each correct intervention).
+Needed interventions derived from episode:
+- `ventilation_hours > 0` → needs one of: intubat, mechanical ventil, vent
+- `has_arterial_line` → needs one of: arterial line, a-line, radial art
+- `has_dialysis` → needs one of: dialysis, crrt, hemodialysis, cvvh
+- `fluid_overloaded` → needs one of: fluid bolus, volume resuscitation, iv fluid
 
-#### Step 4 — High-Risk Medications (max 0.10)
+```
+score = (matched_needed / total_needed) × 0.15
+if no interventions needed → 0.10 (default credit)
+```
 
-Identifies which high-risk drugs are actually in the patient's medication/eMAR record:
-- Anticoagulants: heparin, warfarin, enoxaparin, apixaban, dabigatran, rivaroxaban
-- Vasopressors: norepinephrine, epinephrine, dopamine, vasopressin, phenylephrine
-- Sedatives: propofol, midazolam, fentanyl, lorazepam, dexmedetomidine
+#### Step 4 — High-Risk Medication Identification (max 0.10)
 
-Uses 5-character stem matching to handle generic/brand variation. Computes F1 between the agent's flagged list and the true high-risk drug set.
+```json
+{"task_id": 4, "task4": {"high_risk_medications": ["heparin", "propofol"]}}
+```
 
-#### Step 5 — Antibiotic Plan (max 0.10)
+High-risk drug sets:
+- Anticoagulants: heparin, warfarin, enoxaparin, apixaban, rivaroxaban, dabigatran
+- Vasopressors: norepinephrine, epinephrine, dopamine, vasopressin, phenylephrine, dobutamine
+- Sedatives: propofol, midazolam, fentanyl, lorazepam, ketamine, dexmedetomidine
 
-Checks microbiology results:
-- **No organisms**: "none" strategy = 1.0; "broad"/"empiric" = 0.4 (unnecessary but not harmful)
-- **Organisms present**: "targeted" + matching sensitive antibiotics = 1.0; "targeted" alone = 0.5; "broad" = 0.3; "none" = 0.0
+```
+F1 = 2 × (tp / present) × (tp / flagged) / sum
+score = F1 × 0.10
+if no high-risk drugs present → 0.10 if agent unflagged, 0.06 if agent flagged anyway
+```
 
-**Isolation bonus (+0.02)**: If any resistant organism (MRSA, VRE, ESBL, KPC, CRE) is found, a small bonus is added if the agent correctly notes the need for isolation — this is separate from the antibiotic score and encourages infection control awareness.
+#### Step 5 — Antibiotic Stewardship (max 0.10)
+
+```json
+{"task_id": 4, "task4": {
+  "antibiotic_strategy": "targeted",
+  "antibiotics": ["vancomycin", "piperacillin-tazobactam"]
+}}
+```
+
+Valid strategies: `none` | `targeted` | `broad` | `empiric` | `culture-directed` | `prophylaxis`
+
+Scoring:
+```
+if no organisms detected:
+  "none" → 1.0; "broad"/"empiric" → 0.4; else → 0.2
+if organisms detected:
+  "targeted"/"culture-directed" → 0.5 + 0.5 × (matched_antibiotics / organisms)
+  "broad"/"empiric" → 0.3
+  "none" → 0.0
+  else → 0.2
+resistant_organisms_bonus: +0.02 if MRSA/VRE/ESBL present and identified
+score = min(1.0, base + bonus) × 0.10
+```
 
 #### Step 6 — Fluid Strategy (max 0.08)
 
-Three-way classification based on `fluid_balance`:
-```
-fluid_overloaded == True → correct = "restrict_diuresis"
-oliguria == True AND net_balance < 0 → correct = "aggressive_resuscitation"
-otherwise → correct = "maintain"
+```json
+{"task_id": 4, "task4": {"fluid_strategy": "restrict_diuresis"}}
 ```
 
-Exact match: 1.0. Wrong direction (restrict vs aggressive): 0.0. Off-by-one (maintain when restrict/resuscitate needed): 0.4.
+Valid strategies: `restrict_diuresis` | `aggressive_resuscitation` | `maintain`
 
-#### Step 7 — ICU Readiness (max 0.08)
+Correct strategy derivation:
+- `fluid_overloaded = True` → correct = `restrict_diuresis`
+- `oliguria = True AND net_balance < 0` → correct = `aggressive_resuscitation`
+- Otherwise → correct = `maintain`
 
-Determines if the patient is clinically ready to move to stepdown/floor:
 ```
-true_ready = los_days > 5 AND ventilation_hours == 0 AND last care_trajectory unit is "floor"/"stepdown"
+exact match → 1.0
+correct requires action but predicted "maintain" → 0.4
+wrong → 0.0
+score = score × 0.08
 ```
 
-Also scores the agent's `barriers` list against actual documented barriers (on-vent, oliguria, dialysis-dependent).
+#### Step 7 — ICU-to-Stepdown Readiness (max 0.08)
 
-`combined = readiness_accuracy × 0.6 + barrier_detection × 0.4`
+```json
+{"task_id": 4, "task4": {
+  "ready_for_stepdown": false,
+  "barriers": ["mechanical ventilation", "hemodynamic instability"]
+}}
+```
 
-#### Step 8 — Disposition + LOS Estimate (max 0.10)
+Barrier categories detected from episode:
+- vent: `ventilation_hours > 0`
+- renal: `oliguria` or `has_dialysis`
+- hemodynamic: vasopressors in active medications
 
-Disposition scoring (same algorithm as Task 1 but lower max):
-- Exact match: 0.06
-- Broad group match: 0.03
-- Adjacent match: 0.015
+True readiness: `los_days > 5 AND not on vent AND not on vasopressors`
 
-LOS estimate scoring (compare `los_remaining_days` to actual `hospital_los_days`):
-- Within ±2 days: 0.04
-- Within ±5 days: 0.02
-- Further: 0.0
+```
+readiness_score = 1.0 if pred_ready == true_ready, else 0.2
+barrier_score = matched_barriers / actual_barriers (1.0 if no barriers)
+score = (0.6 × readiness_score + 0.4 × barrier_score) × 0.08
+```
 
-Step 8 stores `step8_predicted_dispo` in the shaping log — used at Step 10 for the consistency bonus.
+#### Step 8 — Discharge Disposition + LOS Estimate (max 0.10)
+
+```json
+{"task_id": 4, "task4": {
+  "predicted_disposition": "snf",
+  "los_remaining_days": 3.0
+}}
+```
+
+```
+disposition:
+  exact → 0.06; same broad group → 0.03; adjacent → 0.015; wrong → 0.0
+
+LOS error = |predicted − actual_remaining|:
+  ≤ 2 days → 0.04; ≤ 5 days → 0.02; > 5 days → 0.0
+
+score = disposition_score + los_score
+```
 
 #### Step 9 — Medication Reconciliation (max 0.10)
 
-Finds eMAR medications `active_at_discharge = True` (or falls back to `pharmacy_active` list if eMAR is empty). Computes F1 between the agent's `medications_to_continue` list and the true active discharge medications, using 4-character stem matching.
+```json
+{"task_id": 4, "task4": {
+  "medications_to_continue": ["Lisinopril 10mg", "Metoprolol 25mg"]
+}}
+```
 
-#### Step 10 — Final Note + Composite Reward
+Active discharge medications sourced from `emar_summary` where `active_at_discharge = True`.
 
-```python
-# Base note quality from NoteGrader (Tasks 3 algorithm)
-base_reward = NoteGrader().grade(final_note, episode)[0]
+Drug stem matching: first 4+ char token or first 6 chars.
 
-# Prior step performance average
-step_scores = [shaping_log[f"step{i}_reward"] / STEP_MAX[i] for i in range(1, 10)]
-shaping_avg = mean(step_scores)
+```
+F1 = 2 × recall × precision / (recall + precision)
+recall = matched_active / total_active
+score = F1 × 0.10
+if no active meds in episode → 0.07 fixed credit
+```
 
-# Combined
-raw = base_reward × 0.60 + shaping_avg × 0.40
+#### Step 10 — Final Discharge Note (composite reward)
 
-# Consistency bonus: final note disposition matches Step 8 prediction
-if final_note mentions same disposition as step8_predicted_dispo:
-    consistency_bonus = 0.10
+```json
+{"task_id": 4, "task4": {
+  "final_note": "PRINCIPAL DIAGNOSIS:\n...[full note with all 7 sections]..."
+}}
+```
 
-# Trajectory bonus: ≥50% specialty overlap with Step 2 expected consults
-if note mentions ≥50% of step2_expected_specialties:
-    trajectory_bonus = 0.05
+```
+note_score  = Task3Grader.grade(final_note, episode)
+shaping_avg = mean([shaping_log[i] / _STEP_MAX[i] for i in 1..9])
 
-# Revision cost
-revision_cost = shaping_log["revisions_used"] × 0.02
+raw = 0.60 × note_score + 0.40 × shaping_avg
 
-final = clamp(raw + consistency_bonus + trajectory_bonus - revision_cost, 0.0, 1.0)
+consistency_bonus = +0.10 if step8_predicted_dispo found in final_note
+trajectory_bonus  = +0.05 if ≥50% of step2_expected_specialties appear in final_note
+revision_cost     = −0.02 × revisions_used  (max 2 revisions)
+
+final = min(1.0, max(0.0, raw + bonuses − revision_cost))
 ```
 
 ### Revision Mechanism
 
-At any step 1-9, the agent can include `revise_step + revision` in their action instead of (or alongside) the normal step fields. This causes:
-1. The grader for the specified prior step is re-run with the revised content
-2. The `step{N}_reward` entry in `shaping_log` is overwritten with the new score
-3. `shaping_log["revisions_used"]` increments by 1
+The agent can revise any step 1–9 decision (max 2 revisions total):
 
-Maximum 2 revisions. Each costs 0.02 from the final reward. This enables the agent to backtrack if it realises (e.g., at step 7) that its step 5 antibiotic choice was wrong once microbiology results were revealed at step 5.
+```json
+{
+  "task_id": 4,
+  "task4": {"revise_step": 3, "revision": {"interventions": ["dialysis", "arterial line"]}}
+}
+```
 
-### Progressive Observation Gating for Task 4
+Each revision: returns `reward=0, done=False`, consumes one revision slot, updates `_shaping_log`.
 
-The agent only sees what's clinically relevant at each step — mimicking how a physician orders tests and receives results over time:
+### Step Max Contributions
 
-| Step | Newly Revealed |
-|------|---------------|
-| 1 | Demographics, diagnoses, ICU stays (always) |
-| 2 | Lab flags |
-| 3 | Vitals, ICU procedures |
-| 4 | Medications, eMAR summary |
-| 5 | Microbiology |
-| 6 | Fluid balance |
-| 7 | Care trajectory |
-| 8+ | Discharge orders, full observation |
-
-### Episode History — In-Context Memory
-
-After each step, `env._episode_history` is updated with a one-line summary of the action taken (`_format_action_summary()`). From step 2 onward, the `Observation.episode_history` field contains this list, allowing the agent to see its prior decisions in context when generating the next step's action. This is essential for coherent multi-step reasoning — without it, the LLM has no memory of what it decided in step 3 when it reaches step 9.
+| Step | Max contribution | Clinical focus |
+|------|-----------------|----------------|
+| 1 | 0.10 | Triage acuity |
+| 2 | 0.15 | Lab + consult prioritization |
+| 3 | 0.15 | Intervention selection |
+| 4 | 0.10 | High-risk med identification |
+| 5 | 0.10 | Antibiotic stewardship |
+| 6 | 0.08 | Fluid management |
+| 7 | 0.08 | Stepdown readiness |
+| 8 | 0.10 | Disposition + LOS forecasting |
+| 9 | 0.10 | Medication reconciliation |
+| 10 | 1.00 (cap) | Final note (composite) |
 
 ---
 
 ## 9. Stochastic Observation Masking
 
-### `_apply_noise(ep, noise_level, hadm_id)` in EpisodeBuilder
+At `/reset`, the `noise_level` parameter controls how much EHR data is corrupted before presenting to the agent.
 
-Controlled stochasticity with per-(hadm_id, noise_level) seeded RNG for reproducibility:
+| Level | Description |
+|-------|-------------|
+| `clean` | Full data — all fields present and accurate |
+| `partial` | 30% of lab results dropped; some medication fields truncated; minor value perturbations |
+| `noisy` | Diagnosis sequence numbers scrambled; up to 50% of labs dropped; medication routes/doses may be wrong; false abnormal flags injected |
 
-```python
-rng = random.Random(f"{hadm_id}:{noise_level}")
-```
-
-| noise_level | What's masked |
-|-------------|--------------|
-| `clean` | Nothing — identical output per hadm_id every time |
-| `partial` | 30% random lab drop, 40% chance weight/BMI → None, medications truncated to 7, 1 random care unit dropped from trajectory |
-| `noisy` | All of partial + diagnoses shuffled (sequence numbers randomised), 25% microbiology rows dropped, 2 random vitals removed, 20% chance fluid_balance → None, 15% drug names in medications replaced with formulary codes |
-
-**Training use per task**:
-- **Task 1**: `noise_level="clean"` — disposition decisions are fragile to missing clinical signals (GCS, ICD codes); adding masking noise causes near-zero reward even for correct reasoning
-- **Task 2**: `noise_level="clean"` — medication F1 is the dominant scoring component; the 30% lab drop + medication truncation of `partial` mode pushes F1 near zero even for a correct care plan, killing gradient signal
-- **Task 3**: `noise_level="partial"` — forces generalisation from incomplete labs and truncated med lists; `noisy` mode scrambles diagnosis sequence numbers, making `diagnosis_coverage` always 0.0 and eliminating the 0.30-weight signal
-- **Evaluation**: `noise_level="clean"` for all tasks (fully reproducible)
-
-The seeded RNG means the same (hadm_id, noise_level) combination always produces the same masked observation, making training rollouts reproducible and comparable across model versions.
+**Training curriculum noise assignment:**
+- Task 1 / Task 2 → `clean` (clear signal needed for early learning)
+- Task 3 / Task 4 → `partial` (introduces real-world incompleteness without destroying all signal)
 
 ---
 
-## 10. Curriculum Learning
+## 10. GRPO Training Pipeline
 
-### `_sample_hadm_id(curriculum_mode, task_id)` in MIMICDischargeEnv
+**File:** `training/train_grpo.py`
 
-The `curriculum_mode` parameter controls which complexity tier episodes are sampled from:
+### Model Configuration
 
-| Mode | Pool | Use case |
-|------|------|----------|
-| `random` | All hadm_ids | Default / general evaluation |
-| `easy_only` | Home discharge, LOS≤4, no ICU, ≤5 diagnoses | Early training |
-| `medium_only` | Intermediate complexity | Mid-phase training |
-| `hard_only` | SNF/rehab/hospice/died, LOS>14, vent>24h, resistance, oliguria | Advanced training / Task 4 |
-| `progressive` | Easy (eps 0-199) → Medium (200-499) → Random (500+) | Automated curriculum |
+- Model: Qwen/Qwen2.5-3B-Instruct (bfloat16)
+- Adapter: LoRA r=16, alpha=32, dropout=0.05, target modules = all linear layers
+- Max sequence length: 2560 tokens (prompt 1536 + completion 768 + buffer)
+- Loaded via 4-bit NF4 quantization (bitsandbytes) if available
 
-The complexity index is built once at `EpisodeBuilder.__init__()` by classifying all available admissions. It's stored as `{complexity: [hadm_id, ...]}` and accessed via `sample_by_complexity(tier)`.
+### GRPO Hyperparameters
 
-For Task 4, hard_only is recommended since the 10-step ICU workflow is only meaningful for patients who actually had ICU stays with multi-system illness.
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| `num_generations` | 8 | Min for non-degenerate GRPO advantage estimation |
+| `batch_size` | 2 | L4 24GB VRAM limit |
+| `grad_accum` | 8 | Effective batch = 16 |
+| `learning_rate` | 5e-6 | Conservative for small RL budget |
+| `beta` | 0.04 | KL penalty — prevents policy from collapsing away from base model diversity |
+| `top_entropy_quantile` | 0.8 | Drop bottom 20% entropy completions — prunes mode-collapsed outputs |
+| `temperature` | 1.3 (T1) / 1.1 (T2) / 0.9 (T3/T4) | Higher early to escape hospice collapse |
+| `warmup_steps` | 10 | Short warm-up per chunk |
 
-### GRPO Training Curriculum
+### Curriculum (7-hour L4 budget)
 
-The `_curriculum(step)` function in `train_grpo.py` controls which task and noise level the reward function uses at each training step. **Task 4 is excluded from the GRPO curriculum** because its 10-step sparse reward (only step 10 signals) means the GRPO batch would need to contain multiple complete 10-step episodes to yield non-zero variance — impractical at typical batch sizes of 4–8 rollouts per prompt.
+| Phase | Steps | Task | Patient pool | Seed N |
+|-------|-------|------|-------------|--------|
+| 1 | 0–199 | Disposition | medium_only (109) | 220 |
+| 2 | 200–349 | Care Plan | medium_only (109) | 220 |
+| 3 | 350–449 | Discharge Note | random (all 233) | 466 |
+| 4 | 450–549 | ICU Workflow | hard_only (103) | 210 |
+
+**Seed auto-scaling:** `seed_n = max(floor, pool_size × 2)` — ensures every unique patient appears at least twice per chunk.
+
+### Chunk Loop
+
+Every `eval_every=50` steps:
+1. Determine `(task_id, noise_level, curriculum_mode)` from `_curriculum(global_step)`
+2. Build fresh seed dataset (new env resets, stores `hadm_id` in each row)
+3. Build reward function closure with task locked
+4. Instantiate GRPOTrainer with new dataset + reward function
+5. Train for 50 steps
+6. Save model checkpoint + `train_state.json`
+7. Check dead-gradient stop conditions
+
+### hadm_id Coupling (Critical Fix)
+
+Each seed dataset row stores the `hadm_id` of the patient used in the prompt:
 
 ```python
-def _curriculum(step):
-    if step < 1000:   return 1, "clean",   "easy_only"    # Task 1: learn dispositions
-    if step < 3000:   return 2, "clean",   "medium_only"  # Task 2: care plan + info protocol
-    return               3, "partial",  "random"          # Task 3: free-text note generation
-    # Task 4 excluded: sparse reward produces near-zero GRPO variance at standard batch sizes
+rows.append({
+    "prompt": [...],
+    "hadm_id": str(obs.get("hadm_id", "")),
+})
 ```
 
-| Phase | Steps | Task | Noise | Curriculum mode | Rationale |
-|-------|-------|------|-------|-----------------|-----------|
-| 1 | 0–999 | 1 | clean | easy_only | Learn 8-category disposition on unambiguous home-discharge cases |
-| 2 | 1000–2999 | 2 | clean | medium_only | Learn care plan with info-request protocol; clean noise preserves medication F1 signal |
-| 3 | 3000+ | 3 | partial | random | Learn free-text note generation across all complexity tiers |
+The reward function pins `/reset` to that specific patient before scoring:
+
+```python
+reset_body["hadm_id"] = int(hadm_id[i])
+_env_post(env_url, "/reset", reset_body)
+# ... then step with the model's action
+```
+
+Without this, the reward scores a randomly sampled patient — completely decoupling the reward from the prompt the model saw. This was the primary cause of near-zero learning in early runs.
+
+### Reward Function
+
+```python
+reward = alpha × env_score + (1 - alpha) × format_score
+```
+
+- Task 1: α = 0.80 (env), 0.20 (format)
+- Task 2: α = 0.85, 0.15
+- Task 3: α = 0.90, 0.10
+- Task 4: α = 0.90, 0.10
+
+Format score = 1.0 if valid JSON parseable as the correct task schema, else 0.0.
+
+**Task 4 reward function:** Runs 9 default advance actions (one per step) to reveal all EHR data before scoring the model's `final_note` at step 10.
+
+### Dead-Gradient Guard
+
+Training halts if the zero-reward rate for the current task exceeds its threshold over the last 50 rollouts:
+
+| Task | Halt threshold |
+|------|---------------|
+| T1 | 80% zero-reward |
+| T2 | 90% zero-reward |
+| T3 | 90% zero-reward |
+| T4 | 90% zero-reward |
+
+Zero is defined as reward < 0.12 (above wrong-task-key floor of 0.03, below minimum valid same-task reward of 0.15).
+
+### Training Results Summary
+
+| Task | Steps | Peak reward | Stabilized at | Key observation |
+|------|-------|-------------|---------------|-----------------|
+| Disposition | 0–199 | **0.73** | — | Climbs steadily from 0.24; model learns HOME vs HWS |
+| Care Plan | 200–349 | — | **~0.60** | Fast stabilization; specialty + med F1 both contributing |
+| Discharge Note | 350–435 | — | **~0.45** | High variance; longer outputs harder to optimize |
+| **Overall** | — | — | **0.517** | Mean across all rollouts |
+
+Parse rate: ≥95% through Tasks 1–2; ~85% in Task 3.
+Zero-reward rate: <2% for T1/T2; spikes to 53% at T3 start, recovers to ~30%.
 
 ---
 
-## 11. Multi-Agent / Multi-Step Design
+## 11. Server API Reference
 
-### How the Environment Handles Long-Horizon Agents
+**File:** `server/app.py`  
+**Base URL:** `http://localhost:7860`
 
-The environment is designed to support three distinct long-horizon patterns:
+### Core RL Loop
 
-#### Pattern 1: Information Gathering (Task 2)
-The agent reasons about what data it needs, requests it, then acts. This mirrors a clinical decision-making pattern: "I don't know enough yet; let me order more tests."
+#### POST /reset
 
-```
-reset() → partial obs
-step(info_request: ["labs", "vitals"]) → enriched obs, reward=0
-step(task2: {care_plan}) → final obs=None, reward=0.7
-```
-
-The key architectural feature: `_revealed_info` is a Set stored on the env instance that accumulates across steps. Each `_build_observation()` call consults this set to decide which fields to include. The agent's history of information requests is implicit in the growing observation.
-
-#### Pattern 2: Sequential Clinical Workflow (Task 4)
-The agent manages a patient through an admission, making different types of decisions at each step. Prior decisions affect later scoring (shaping) and the agent has explicit memory via `episode_history`.
-
-```
-reset() → step 0 obs (minimal: demographics + diagnoses)
-step(task4: {triage_level}) → step 1 obs (now includes labs)
-step(task4: {priority_labs, priority_consults}) → step 2 obs (now includes vitals)
-...
-step(task4: {final_note}) → reward=0.7, done=True
-```
-
-The `_shaping_log` dict persists across all 10 steps on the env instance. It's updated by the grader after each step call. At step 10, the grader reads this accumulated log to compute the composite reward.
-
-#### Pattern 3: Iterative Refinement (Task 4 Revision)
-The agent can revise earlier decisions after receiving new information. This is structurally different from most RL environments — the "state" includes a mutable history that can be edited:
-
-```
-step 5: receive microbiology results (now visible)
-step 5 action: {antibiotic_strategy: "targeted", antibiotics: ["vancomycin"]}
-step 6: receive fluid_balance
-step 6 action: {
-  fluid_strategy: "restrict_diuresis",
-  revise_step: 5,
-  revision: {antibiotic_strategy: "targeted", antibiotics: ["vancomycin", "pip-tazo"]}
+```json
+{
+  "task_id": 1,
+  "hadm_id": null,
+  "noise_level": "clean",
+  "curriculum_mode": "random"
 }
 ```
 
-The revision re-grades step 5 with the new content and overwrites the shaping log entry. This allows the agent to correct mistakes when it receives new information, at a small cost.
+Returns: full `Observation` JSON  
+Errors: 400 (invalid task_id) · 503 (not ready)
 
-### Single-Process Limitation
+#### POST /step
 
-The current server uses a single `MIMICDischargeEnv` instance, meaning only one episode can be active at a time. For multi-agent training at scale, either:
-1. Run multiple server instances on different ports
-2. Extend the server to support session-keyed env instances (e.g., `POST /reset` returns a `session_id` that's passed to `POST /step`)
+```json
+{
+  "task_id": 1,
+  "task1": {"disposition": "home_with_services", "reasoning": "..."},
+  "information_request": null
+}
+```
 
-The `/rollout` endpoint partially addresses this by accepting a complete list of actions and executing the full episode server-side in one request, which is safe for parallel training calls as long as each rollout call is atomic.
+Returns: `StepResult` = `{observation, reward, done, partial_signals, info}`  
+Errors: 409 (no active episode) · 422 (Pydantic validation failed) · 503 (not ready)
+
+#### POST /rollout
+
+Run a full multi-step rollout in one call:
+
+```json
+{
+  "task_id": 2,
+  "actions": [
+    {"task_id": 2, "information_request": ["labs", "medications"]},
+    {"task_id": 2, "task2": {"follow_up_specialties": [...], ...}}
+  ],
+  "hadm_id": null,
+  "noise_level": "clean"
+}
+```
+
+Returns: `{task_id, hadm_id, total_reward, n_steps, trajectory: [...]}`
+
+### Observability Endpoints
+
+#### GET /health
+
+```json
+{
+  "status": "ok",
+  "ready": true,
+  "uptime_seconds": 3600.5,
+  "episodes_available": 233,
+  "env_active": true,
+  "total_episodes_run": 1042,
+  "current_task": 1,
+  "current_hadm_id": 27703517
+}
+```
+
+#### GET /metrics
+
+Returns per-route latency percentiles (p50/p95/p99), per-task reward stats, JSON parse success rate, revision count, complexity distribution.
+
+#### GET /history?n=10
+
+Returns last N completed episodes with full reward breakdowns (max 50).
+
+#### GET /state
+
+Debug endpoint — returns ground truth: `current_task_id`, `current_hadm_id`, `step_num`, `last_reward`, `ground_truth: {true_disposition, active_medications, ...}`
+
+### Metadata Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /tasks` | All 4 tasks with schemas, scoring weights, difficulty |
+| `GET /episodes?sample=5` | Total count + sample hadm_ids |
+| `GET /episodes/by_complexity` | All hadm_ids grouped by easy/medium/hard |
+| `GET /complexity/{hadm_id}` | Complexity tier for a specific admission |
+| `GET /docs` | Interactive Swagger UI |
+
+### Request Tracking
+
+Every request gets an `X-Request-ID` header (8-char UUID) and `X-Response-Time` (ms).  Server logs: `method path status latency req_id`.
 
 ---
 
-## 12. Training Pipeline
-
-### Rollout Collection — `training/rollout_collector.py`
-
-#### `format_observation(obs: Dict, task_id: int) → str`
-
-The core function for converting a structured `Observation` dict to a text prompt for the LLM. It prepends a `_SYSTEM_PROMPT` (clinician persona) and formats all visible fields into clearly labelled sections. Key labelling conventions that are critical for scoring correctness:
+## 12. End-to-End Data Flow
 
 ```
-You are a clinical physician making evidence-based discharge planning decisions...
-
-=== PATIENT CLINICAL SUMMARY ===
-Task: Discharge Disposition Classification
-Hadm ID: 29079034 | Subject: 10006 | Step: 0/1
-
---- DEMOGRAPHICS ---
-Age: 68 | Gender: M
-Admission type: EMERGENCY
-LOS: 12.3 days | Complexity: hard
-
---- DIAGNOSES ---
-  [1] [C79.51] Secondary malignant neoplasm of bone (ICD10)
-  [2] [Z51.5] Encounter for palliative care (ICD10)  ← V667/Z51.5 → hospice
-  [3] [I50.9] Heart failure, unspecified (ICD10)
-
---- VITALS ---
-  Heart Rate: adm=92 dc=78 range=[58–118]
-  GCS Total: adm=4 dc=3 range=[3–8]  ← CRITICAL
-
---- ABNORMAL LABS ---
-  Creatinine: 3.2 [Abnormal]
-  BNP: 1840 [Critical]
-
---- ACTIVE MEDICATIONS AT DISCHARGE (use EXACT names) ---
-  metoprolol succinate
-  furosemide
-  lisinopril
-
---- STOPPED/DISCONTINUED MEDICATIONS ---
-  heparin sodium
-  insulin regular
-
---- MICROBIOLOGY ---
-  Blood: Staphylococcus aureus [resistant: oxacillin] → add Infectious Disease
-
---- DISCHARGE ORDERS ---
-  Discharge planning finalized: Yes
-  Orders: Follow-up with Cardiology, Home health referral placed
-
---- TASK SCHEMA ---
-[task-specific decision tree or scoring rules inserted here]
-
---- ACTION REQUIRED ---
-Respond ONLY with valid JSON:
-{"task_id": 1, "task1": {"disposition": "...", "reasoning": "..."}}
-```
-
-Critical labelling decisions:
-- `pharmacy_active` is labelled **"ACTIVE MEDICATIONS AT DISCHARGE (use EXACT names)"** — the Task 2 and Task 3 graders score only against this list; using medication order names instead causes hallucination penalties
-- `pharmacy_stopped` is labelled **"STOPPED/DISCONTINUED MEDICATIONS"** — for Task 2 `medications_to_discontinue`
-- GCS values ≤ 8 get a `← CRITICAL` annotation to flag end-of-life risk
-- Microbiology with positive organisms appends `→ add Infectious Disease` to prompt specialty selection
-- Each task's schema (`_T1_SCHEMA`, `_T2_SCHEMA`, `_T3_SCHEMA`) is injected inline, providing the ICD-9 range table, ICD-10 prefix table, and decision rules at inference time
-
-#### `_extract_json(text) → Optional[Dict]`
-
-Three-pass extraction:
-1. Direct `json.loads()` (handles clean JSON output)
-2. Regex extraction of ` ```json ... ``` ` or ` ``` ... ``` ` code blocks
-3. Greedy `{...}` pattern extraction (fallback for JSON embedded in prose)
-
-Returns `None` if all passes fail. The caller invokes `_fallback_action(task_id, obs)` instead of a no-op — this uses deterministic clinical heuristics (ICD code analysis, `pharmacy_active` lookup) to generate a non-zero-reward action even when the LLM output is unparseable. This is important for GRPO: a guaranteed-zero fallback removes all gradient signal from failure cases, whereas a heuristic fallback may still score 0.3–0.6 and provides a useful baseline for the group advantage calculation.
-
-#### `run_episode(task_id, hadm_id, noise_level)` — Task 2 info-request protocol
-
-For Task 2, the rollout collector automatically pre-requests information on step 0 before the LLM generates its care plan. This mirrors the inference-time protocol and ensures the LLM sees populated medication and lab data when it formulates the plan:
-
-```python
-if task_id == 2:
-    obs = env.reset(task_id=2, ...)
-    # Auto info-request: unlock labs + medications + microbiology
-    if not obs.get("medications") and not obs.get("lab_flags"):
-        env.step({"task_id": 2, "information_request": ["labs", "medications", "microbiology"]})
-        obs = env.state()  # now obs has meds/labs populated
-    # LLM generates care plan from enriched obs (step 1 onward)
-    prompt = format_observation(obs, task_id=2)
-    response = _llm(prompt)
-    action = _extract_json(response) or _fallback_action(2, obs)
-    # Guard: do not issue second info_request from model output at step ≥ 1
-    if "information_request" in action and step_num >= 1:
-        action = _fallback_action(2, obs)
-    result = env.step(action)
-```
-
-Without this pre-step, the LLM would be asked to recommend medications from an observation with `medications: []`, producing hallucinated drug names that fail the F1 check.
-
-#### `RolloutCollector.collect(task_id, n_episodes) → Dataset`
-
-Runs `n_episodes` full episodes (each potentially multi-step for Task 2/4) and saves results as a HuggingFace Dataset with these columns:
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `prompt` | str | Formatted observation text |
-| `response` | str | Raw LLM output |
-| `reward` | float | Environment reward for this step |
-| `partial` | str | JSON-encoded partial signals |
-| `hadm_id` | int | Episode identifier |
-| `task_id` | int | Task |
-| `step_num` | int | Step within episode |
-| `parse_ok` | bool | Whether action JSON was valid |
-| `episode_idx` | int | Episode index within collection run |
-
----
-
-### GRPO Training — `training/train_grpo.py`
-
-#### What is GRPO?
-
-Group Relative Policy Optimization (GRPO) is a variant of PPO adapted for language model fine-tuning. Instead of a value network, it uses the mean reward of a **group** of rollouts from the same prompt as a baseline:
-
-```
-advantage_i = (reward_i - mean(group_rewards)) / std(group_rewards)
-```
-
-This is more stable for LLMs than standard PPO because:
-1. No value network needed (fewer parameters to train)
-2. The baseline adapts naturally to the difficulty of each prompt
-3. Works well with sparse rewards (the group variance captures relative performance)
-
-`num_generations=4` means 4 independent rollouts per prompt per training step. The model learns to improve the high-reward rollouts relative to the group mean.
-
-#### Model Loading
-
-With Unsloth installed:
-```python
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="Qwen/Qwen2.5-3B-Instruct",
-    max_seq_length=2048,
-    load_in_4bit=True,    # QLoRA: 4-bit quantisation
-)
-model = FastLanguageModel.get_peft_model(model,
-    r=16,                 # LoRA rank
-    lora_alpha=16,        # scaling factor
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                    "gate_proj", "up_proj", "down_proj"],
-)
-```
-
-Without Unsloth (fallback): standard `transformers` + `peft` LoraConfig with the same rank-16 configuration.
-
-#### Reward Function
-
-The `make_reward_fn()` factory returns a function that TRL calls after each generation batch:
-
-```python
-def reward_fn(prompts, responses, **kwargs) -> List[float]:
-    task_id, noise_level, curriculum_mode = _curriculum(step_counter[0])
-    for prompt, response in zip(prompts, responses):
-        action_dict = _extract_json(response) or {}
-        action_dict["task_id"] = task_id
-        env.reset(task_id=task_id, noise_level=noise_level, curriculum_mode=curriculum_mode)
-
-        # Task 2: pre-request info so the grader scores against populated medication state
-        if task_id == 2:
-            env.step({"task_id": 2, "information_request": ["labs", "medications", "microbiology"]})
-
-        result = env.step(action_dict)
-        rewards.append(result.reward)
-    step_counter[0] += len(responses)
-    return rewards
-```
-
-**Why the Task 2 pre-step matters**: The CarePlanGrader computes medication F1 against `pharmacy_active`. If the reward function calls `env.step(care_plan)` without first calling `env.step(information_request)`, the environment's `_revealed_info` set doesn't include `"medications"` — causing the grader to compare against an empty medication list and assigning near-zero F1. The pre-step mirrors the 2-step optimal strategy: one info request + one care plan submission = 1.0× efficiency multiplier.
-
-For Tasks 1 and 3 (single-step), the reward function is straightforward — each response maps to one scalar reward with no pre-step needed. Task 4 is excluded from the curriculum entirely (see Section 10).
-
-#### Curriculum Phases
-
-```python
-def _curriculum(step):
-    if step < 1000:   return 1, "clean",   "easy_only"    # Phase 1: dispositions
-    if step < 3000:   return 2, "clean",   "medium_only"  # Phase 2: care plans (clean — preserve med F1)
-    return               3, "partial",  "random"          # Phase 3: discharge notes (partial — force generalisation)
-    # Task 4 excluded: 10-step sparse reward → near-zero GRPO variance at standard batch sizes
-```
-
-| Phase | Steps | Task | Noise | Why this combination |
-|-------|-------|------|-------|----------------------|
-| 1 | 0–999 | 1 | clean | Unambiguous signal: learn 8-category disposition tree before harder tasks |
-| 2 | 1000–2999 | 2 | **clean** | `partial` drops 30% of medications → F1 ≈ 0 even for correct plans; clean noise preserves gradient |
-| 3 | 3000+ | 3 | **partial** | `noisy` scrambles diagnosis seq numbers → `diagnosis_coverage` ≈ 0.0; partial only truncates labs/meds |
-
-The training loop refreshes the seed dataset at each evaluation checkpoint (`eval_every` steps) to match the current curriculum phase. This ensures the prompt distribution matches the task and noise level being trained on.
-
-#### `_fallback_action(task_id, obs)` — Clinical Heuristic Fallback
-
-When `_extract_json()` returns `None` (unparseable LLM output), the rollout collector calls `_fallback_action` instead of returning a zero-reward no-op. The fallback uses the same clinical logic as `inference.py`:
-
-```python
-def _fallback_action(task_id, obs):
-    if task_id == 1:
-        disposition = "hospice" if _is_end_of_life(obs) else _rule_based_disposition(obs)
-        return {"task_id": 1, "task1": {"disposition": disposition, "reasoning": "Fallback heuristic"}}
-
-    if task_id == 2:
-        specialties = _specialty_from_dx(obs.get("diagnoses", []))
-        meds = obs.get("pharmacy_active", [])[:8]
-        return {"task_id": 2, "task2": {
-            "follow_up_specialties": specialties,
-            "medications_to_continue": meds,
-            "medications_to_discontinue": obs.get("pharmacy_stopped", [])[:3],
-            "key_instructions": ["Follow up with primary care within 1 week", "Take all medications as prescribed"],
-        }}
-
-    if task_id == 3:
-        dx_names = [d["long_title"] for d in obs.get("diagnoses", [])[:5]]
-        meds = obs.get("pharmacy_active", [])[:8]
-        # Build note that names each diagnosis explicitly (required for diagnosis_coverage)
-        return {"task_id": 3, "task3": {"discharge_note": _build_fallback_note(obs, dx_names, meds)}}
-```
-
-A fallback action for Task 1 can score 0.5–1.05 (broad group or exact match + reasoning bonus). For Task 2 it can score 0.35–0.60 (correct specialties + exact pharmacy_active meds). For Task 3 it can score 0.30–0.65 (structured note with diagnosis names and correct medications). This is far better than the guaranteed 0.0 from a no-op, and it provides meaningful GRPO group variance even when the LLM fails to produce parseable JSON.
-
-#### Dead-Gradient Detection
-
-Monitors whether the current task's reward is consistently 0.0 over the last 50 rollouts:
-
-```python
-zero_buf = deque(maxlen=50)  # stores (reward == 0.0) booleans
-
-if len(zero_buf) == 50:
-    if sum(zero_buf) / len(zero_buf) > 0.60:
-        print("Dead gradient detected — halting")
-        break
-```
-
-This catches the case where the model collapses to outputting invalid JSON or nonsensical actions, which produces all-zero rewards and provides no training signal. Because `_fallback_action` now generates non-zero rewards on parse failure, a dead gradient indicates a deeper problem (e.g., learning rate too high, catastrophic forgetting) rather than just JSON formatting issues. In this case the LoRA adapter may need to be reset or the learning rate reduced.
-
-#### Seed Dataset Pre-stepping for Task 2
-
-`build_seed_dataset()` constructs the initial training prompts for the TRL `GRPOTrainer`. For Task 2, it performs the info-request pre-step so the seed prompts contain a populated observation (medications + labs visible) rather than the sparse step-0 view:
-
-```python
-if task_id == 2:
-    env.reset(task_id=2, ...)
-    env.step({"task_id": 2, "information_request": ["labs", "medications", "microbiology"]})
-    obs = env.state()  # enriched observation for seed prompt
-else:
-    obs = env.reset(task_id=task_id, ...)
-prompt = format_observation(obs, task_id=task_id)
-```
-
-This means the model trains on step-1 observations (the enriched state after info request), which is the state it will actually need to act on during inference — not the empty step-0 state.
-
----
-
-## 13. Server API Layer
-
-### File: `server/app.py`
-
-FastAPI application with async request handling, JSON structured logging, and per-route latency metrics.
-
-### Middleware Stack
-
-1. **CORS**: All origins allowed (open hackathon environment)
-2. **Request ID middleware**: Every request gets a UUID8 header `X-Request-ID` and timing in `X-Response-Time`
-3. **Metrics middleware**: Updates `_Metrics` with per-route latency (ring buffer of last 500 per route) and status codes
-
-### Metrics Collected
-
-```python
-class _Metrics:
-    request_count:    Dict[str, int]           # per route
-    error_count:      Dict[str, int]           # per route (4xx/5xx)
-    latency_ms:       Dict[str, List[float]]   # ring buffer, last 500
-    episode_count:    int
-    total_reward:     float
-    rewards_by_task:  Dict[int, List[float]]
-    json_parse_attempts: int
-    json_parse_success:  int                   # always = attempts (Pydantic validates)
-    revision_count:   int                      # Task 4 revisions
-    complexity_counts: Dict[str, int]          # episodes per complexity tier
-```
-
-Exposed at `GET /metrics` with p50/p95/p99 latency percentiles per route and per-task reward statistics.
-
-### Episode History Buffer
-
-A ring deque of the last 50 completed episodes:
-```python
-class _EpisodeHistory:
-    MAX_HISTORY = 50
-    _buf: Deque[Dict]  # appendleft (newest first)
-```
-
-Each entry: `{task_id, hadm_id, reward, steps, complexity, partial_signals, completed_at}`.
-
-Accessible at `GET /history?n=10`.
-
-### Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/reset` | Start new episode, returns Observation |
-| POST | `/step` | Submit action, returns StepResult |
-| POST | `/rollout` | Run full episode from action list |
-| GET | `/health` | Server readiness + basic stats |
-| GET | `/metrics` | Latency percentiles + reward stats |
-| GET | `/history` | Last N completed episodes |
-| GET | `/state` | Current episode ground truth (debug) |
-| GET | `/tasks` | Task catalogue with scoring weights |
-| GET | `/episodes` | Total count + random sample of hadm_ids |
-| GET | `/complexity/{hadm_id}` | Complexity tier for specific admission |
-| GET | `/episodes/by_complexity` | All hadm_ids grouped by tier |
-
-### Error Handling
-
-Pydantic validation errors on the action body return HTTP 422 with field-level detail. All unhandled exceptions return HTTP 500 with the request ID for log correlation. The `_require_env()` helper returns 503 if the environment is still initialising (MIMIC tables loading). The `_require_active()` helper returns 409 if `POST /step` is called without a prior `POST /reset`.
-
----
-
-## 14. End-to-End Request Flow
-
-### Task 1 (single step)
-
-```
-POST /reset {"task_id": 1}
-  → EpisodeBuilder.get_episode(random_hadm_id, "clean")
-  → _build_observation() → full Observation (no gating)
-  → 200 OK {age: 68, diagnoses: [...], ...}
-
-POST /step {"task_id": 1, "task1": {"disposition": "snf", "reasoning": "..."}}
-  → DispositionGrader.grade()
-      → normalize_mimic_location("SKILLED NURSING FACILITY") = "snf"
-      → pred "snf" == true "snf" → score = 1.0
-      → reasoning bonus: "ICU stay" in reasoning → +0.05 (clamped to 1.0)
-  → StepResult(reward=1.0, done=True, partial_signals={disposition_exact: 1.0, ...})
-  → 200 OK
-```
-
-### Task 2 (multi-step)
-
-```
-POST /reset {"task_id": 2, "curriculum_mode": "medium_only"}
-  → Sample medium-complexity hadm_id
-  → _build_observation() → partial obs (only demographics + top5 dx + LOS + complexity)
-  → 200 OK {diagnoses: [...top5], medications: [], lab_flags: [], ...}
-
-POST /step {"task_id": 2, "information_request": ["labs", "vitals"]}
-  → _revealed_info updated: {"demographics", "labs", "vitals", ...}
-  → _build_observation() → now includes lab_flags and vitals
-  → StepResult(reward=0.0, done=False, observation={lab_flags: [...], vitals: [...]})
-  → 200 OK
-
-POST /step {"task_id": 2, "task2": {"follow_up_specialties": ["Nephrology"], ...}}
-  → CarePlanGrader.grade()
-      → step_num = 2 → efficiency discount = 1.0
-      → specialty F1: expected={"nephrology"}, rec={"nephrology"} → F1=1.0
-      → ...
-  → StepResult(reward=0.72, done=True)
-  → 200 OK
-```
-
-### Task 4 (10 steps)
-
-```
-POST /reset {"task_id": 4, "curriculum_mode": "hard_only"}
-  → Sample hard-complexity hadm_id (ICU patient)
-  → _build_observation() → minimal obs (step 0, only demos + diagnoses + icu_stays)
-
-POST /step {"task_id": 4, "task4": {"triage_level": "icu"}}
-  → Task4Grader.grade(action, episode, step_num=1, shaping_log={})
-      → _grade_step_1() → score=1.0, scaled_reward=0.10
-      → shaping_log["step1_reward"] = 0.10
-      → Returns reward=0.0 (sparse)
-  → episode_history appended: {step_num:1, action_summary:"Triaged as icu"}
-  → _build_observation() → now includes lab_flags (step 2 threshold met)
-  → StepResult(reward=0.0, done=False)
-
-... (steps 2-9) ...
-
-POST /step {"task_id": 4, "task4": {"final_note": "Patient is a 72-year-old..."}}
-  → Task4Grader.grade(action, episode, step_num=10, shaping_log={...})
-      → NoteGrader on final_note → base_reward=0.62
-      → shaping_avg = mean([0.10/0.10, 0.12/0.15, ...]) = 0.74 (normalised)
-      → raw = 0.62×0.60 + 0.74×0.40 = 0.668
-      → note mentions "home" → consistency_bonus=0.10 (matches step8_predicted_dispo)
-      → note mentions "nephrology" → trajectory_bonus=0.05 (>50% of step2 specialties)
-      → no revisions → revision_cost=0.0
-      → final = 0.668 + 0.10 + 0.05 = 0.818
-  → StepResult(reward=0.818, done=True)
+1. Server startup
+   ├── EpisodeBuilder loads all MIMIC CSV tables (~2s)
+   ├── Classifies all 233 admissions into easy/medium/hard
+   └── Initializes MIMICDischargeEnv with 4 task graders
+
+2. POST /reset (task_id=2, noise_level="clean", curriculum_mode="medium_only")
+   ├── Sample hadm_id from medium tier pool (109 patients)
+   ├── EpisodeBuilder.get_episode(hadm_id) → builds episode dict
+   ├── Apply noise masking (clean → no change)
+   ├── _build_observation() → Task 2: show only demographics + 5 diagnoses
+   └── Return Observation
+
+3. POST /step (information_request: ["labs", "medications", "microbiology"])
+   ├── Update _revealed_info: unlock lab_flags, pharmacy_active/stopped, microbiology
+   ├── _build_observation() → now includes labs, meds, organisms
+   └── Return updated Observation (reward=0, done=False)
+
+4. POST /step (task2: {specialties, medications, instructions})
+   ├── CarePlanGrader.grade(action, episode)
+   │   ├── _specialty_f1() → compare predicted vs ICD-derived expected
+   │   ├── _medication_f1_and_halluc() → stem-match against pharmacy_active
+   │   ├── _instruction_quality() → score 6 categories
+   │   ├── _discontinue_accuracy() → against pharmacy_stopped
+   │   ├── _ghost_specialty_penalty() → unsupported specialties
+   │   └── Apply step 2 efficiency (1.0×)
+   └── Return StepResult (reward=0.62, done=True, partial_signals={...})
+
+5. Training (GRPO)
+   ├── build_seed_dataset() → 220 resets of medium_only, store hadm_id
+   ├── GRPOTrainer generates 8 completions per prompt
+   ├── reward_fn() → reset to same hadm_id, score each completion
+   ├── GRPO computes group-relative advantages
+   ├── Backprop through LoRA weights only
+   └── Checkpoint after every 50 steps
 ```
 
 ---
 
-## 15. curl Test Reference
+## 13. curl Test Reference
 
 ### Health check
-
 ```bash
 curl http://localhost:7860/health
 ```
 
-### Task 1 — full episode
-
+### Task 1 — Disposition
 ```bash
 # Reset
 curl -s -X POST http://localhost:7860/reset \
   -H "Content-Type: application/json" \
-  -d '{"task_id": 1, "noise_level": "clean"}' | python3 -m json.tool
+  -d '{"task_id": 1, "noise_level": "clean"}' | jq .
 
-# Step
+# Submit
 curl -s -X POST http://localhost:7860/step \
   -H "Content-Type: application/json" \
-  -d '{
-    "task_id": 1,
-    "task1": {
-      "disposition": "home",
-      "reasoning": "Patient is medically stable with no IV medications, ambulating independently, family support at home."
-    }
-  }' | python3 -m json.tool
+  -d '{"task_id": 1, "task1": {"disposition": "home_with_services", "reasoning": "Patient requires wound care."}}' | jq .
 ```
 
-### Task 2 — multi-step with information request
-
+### Task 2 — Care Plan (2-step)
 ```bash
-# Reset Task 2
+# Reset
 curl -s -X POST http://localhost:7860/reset \
   -H "Content-Type: application/json" \
-  -d '{"task_id": 2, "noise_level": "clean"}' | python3 -m json.tool
+  -d '{"task_id": 2, "noise_level": "clean", "curriculum_mode": "medium_only"}' | jq .
 
-# Request labs and medications
+# Step 1: Request labs + medications
 curl -s -X POST http://localhost:7860/step \
   -H "Content-Type: application/json" \
-  -d '{
-    "task_id": 2,
-    "information_request": ["labs", "medications"]
-  }' | python3 -m json.tool
+  -d '{"task_id": 2, "information_request": ["labs", "medications", "microbiology"]}' | jq .
 
-# Submit care plan
+# Step 2: Submit care plan
 curl -s -X POST http://localhost:7860/step \
   -H "Content-Type: application/json" \
   -d '{
     "task_id": 2,
     "task2": {
       "follow_up_specialties": ["Cardiology", "Nephrology"],
-      "medications_to_continue": ["metoprolol", "lisinopril", "furosemide"],
-      "medications_to_discontinue": ["heparin", "insulin drip"],
+      "medications_to_continue": ["Lisinopril 10mg", "Metoprolol 25mg"],
+      "medications_to_discontinue": ["Heparin drip"],
       "key_instructions": [
-        "Weigh yourself daily; call doctor if weight increases more than 2 lbs overnight",
-        "Take all medications as prescribed; do not skip doses",
-        "Fluid restriction: no more than 1.5 litres per day",
-        "Return to ED if shortness of breath worsens or you develop chest pain",
-        "Follow-up with Cardiology within 1 week"
-      ],
-      "reasoning": "Heart failure with preserved EF; creatinine elevated suggesting cardiorenal syndrome"
+        "Weigh daily; call if > 2 lbs gain in 24 hours",
+        "Low-sodium diet < 2g/day",
+        "Take Lisinopril every morning",
+        "Follow up with Cardiology within 1 week",
+        "Return to ED if chest pain or worsening shortness of breath"
+      ]
     }
-  }' | python3 -m json.tool
+  }' | jq .
 ```
 
-### Task 3 — discharge note
-
+### Task 3 — Discharge Note
 ```bash
 curl -s -X POST http://localhost:7860/reset \
   -H "Content-Type: application/json" \
-  -d '{"task_id": 3}' > /dev/null
+  -d '{"task_id": 3}' | jq .
 
 curl -s -X POST http://localhost:7860/step \
   -H "Content-Type: application/json" \
   -d '{
     "task_id": 3,
     "task3": {
-      "discharge_note": "DISCHARGE SUMMARY\n\nPRINCIPAL DIAGNOSIS: Acute decompensated heart failure\n\nBRIEF HOSPITAL COURSE: This 68-year-old male with known systolic heart failure presented with a 3-day history of worsening dyspnea and bilateral lower extremity edema. He was admitted to the MICU for 2 days before transfer to the general medical floor. Hospital length of stay was 7 days. He received IV furosemide 80mg twice daily with significant diuresis. Echo showed EF 35%. BNP trended down from 2400 to 680. He was transitioned to oral diuretics prior to discharge.\n\nKEY PROCEDURES: Echocardiogram, right heart catheterisation\n\nDISCHARGE CONDITION: Stable, ambulating with assistance\n\nDISCHARGE DISPOSITION: Discharged home with home health services for daily weights and wound care\n\nDISCHARGE MEDICATIONS: Furosemide 40mg daily, Metoprolol succinate 50mg daily, Lisinopril 10mg daily, Spironolactone 25mg daily\n\nFOLLOW-UP INSTRUCTIONS: Follow up with Cardiology in 1 week. Daily weights — call if gain exceeds 2 lbs. Return to emergency department if shortness of breath worsens, chest pain develops, or systolic BP falls below 90."
+      "discharge_note": "PRINCIPAL DIAGNOSIS:\n1. Nonrheumatic aortic valve stenosis\n\nBRIEF HOSPITAL COURSE:\nThe patient was admitted for 12.8 days and underwent percutaneous aortic valve replacement...\n\nKEY PROCEDURES PERFORMED:\nPercutaneous aortic valve replacement (TAVR).\n\nDISCHARGE CONDITION:\nStable, ambulating independently.\n\nDISCHARGE DISPOSITION:\nThe patient was discharged home with home health services.\n\nDISCHARGE MEDICATIONS:\nAspirin 81mg daily, Clopidogrel 75mg daily.\n\nFOLLOW-UP INSTRUCTIONS:\nFollow up with Cardiology within 1 week. Return to ED if chest pain, shortness of breath, or fever > 38.5C."
     }
-  }' | python3 -m json.tool
+  }' | jq .
 ```
 
-### Task 4 — first 3 steps of workflow
-
+### Task 4 — ICU Workflow (first 3 steps)
 ```bash
-# Reset
 curl -s -X POST http://localhost:7860/reset \
   -H "Content-Type: application/json" \
-  -d '{"task_id": 4, "curriculum_mode": "hard_only"}' | python3 -m json.tool
+  -d '{"task_id": 4, "curriculum_mode": "hard_only"}' | jq .
 
-# Step 1: triage
+# Step 1: Triage
 curl -s -X POST http://localhost:7860/step \
   -H "Content-Type: application/json" \
-  -d '{"task_id": 4, "task4": {"triage_level": "icu"}}' | python3 -m json.tool
+  -d '{"task_id": 4, "task4": {"triage_level": "icu"}}' | jq .
 
-# Step 2: labs + consults
+# Step 2: Labs + consults
 curl -s -X POST http://localhost:7860/step \
   -H "Content-Type: application/json" \
-  -d '{
-    "task_id": 4,
-    "task4": {
-      "priority_labs": ["creatinine", "bnp", "troponin", "lactate"],
-      "priority_consults": ["Cardiology", "Nephrology", "Infectious Disease"]
-    }
-  }' | python3 -m json.tool
+  -d '{"task_id": 4, "task4": {"priority_labs": ["CBC", "BMP", "Troponin"], "priority_consults": ["Cardiology"]}}' | jq .
 
-# Step 3: interventions
+# Step 3: Interventions
 curl -s -X POST http://localhost:7860/step \
   -H "Content-Type: application/json" \
-  -d '{
-    "task_id": 4,
-    "task4": {
-      "interventions": ["mechanical ventilation", "arterial line", "central line", "continuous renal replacement therapy"]
-    }
-  }' | python3 -m json.tool
+  -d '{"task_id": 4, "task4": {"interventions": ["mechanical ventilation", "arterial line"]}}' | jq .
 ```
 
-### Utility endpoints
-
+### Metadata
 ```bash
-# Get complexity for a specific admission
-curl http://localhost:7860/complexity/29079034
-
-# List all episodes by complexity tier
-curl http://localhost:7860/episodes/by_complexity | python3 -m json.tool
-
-# Recent episode history
-curl "http://localhost:7860/history?n=5" | python3 -m json.tool
-
-# Metrics dashboard
-curl http://localhost:7860/metrics | python3 -m json.tool
-
-# Current episode state (ground truth — for debugging)
-curl http://localhost:7860/state | python3 -m json.tool
-
-# Task catalogue with scoring weights
-curl http://localhost:7860/tasks | python3 -m json.tool
-
-# Replay episode with pre-written actions
-curl -s -X POST http://localhost:7860/rollout \
-  -H "Content-Type: application/json" \
-  -d '{
-    "task_id": 1,
-    "hadm_id": 29079034,
-    "noise_level": "clean",
-    "actions": [
-      {"task_id": 1, "task1": {"disposition": "snf", "reasoning": "Long-stay ventilated patient needs skilled nursing"}}
-    ]
-  }' | python3 -m json.tool
-```
-
-### Pin a specific episode for reproducible evaluation
-
-```bash
-# Always test against the same patient
-HADM=29079034
-curl -s -X POST http://localhost:7860/reset \
-  -H "Content-Type: application/json" \
-  -d "{\"task_id\": 1, \"hadm_id\": $HADM, \"noise_level\": \"clean\"}" | python3 -m json.tool
+curl http://localhost:7860/tasks | jq .
+curl http://localhost:7860/episodes/by_complexity | jq .
+curl http://localhost:7860/complexity/27703517 | jq .
+curl "http://localhost:7860/history?n=5" | jq .
+curl http://localhost:7860/metrics | jq .
 ```
 
 ---
 
-*This document covers the complete technical design of MIMIC Discharge Planning v3.2.0 (post-scoring-fix). Key changes from v3.1.0: Task 2/3 noise levels corrected, Task 4 excluded from GRPO curriculum, `_fallback_action` replaces no-op, Task 2 info-request protocol added to rollout collector and reward function, `format_observation` rewritten with labeled pharmacy_active/stopped and task-specific schemas. For the formal machine-readable spec, see `openenv.yaml`.*
+## Thresholds Quick Reference
+
+| Component | Parameter | Value |
+|-----------|-----------|-------|
+| Task 1 | Exact match | 1.00 |
+| Task 1 | Broad group | 0.50 |
+| Task 1 | Adjacent | 0.25 |
+| Task 1 | Reasoning bonus | 0.05 |
+| Task 1 | Min reasoning length | 20 chars |
+| Task 2 | Specialty F1 weight | 0.35 |
+| Task 2 | Medication F1 weight | 0.25 |
+| Task 2 | Instruction quality weight | 0.25 |
+| Task 2 | Discontinue accuracy weight | 0.15 |
+| Task 2 | Max hallucination penalty | 0.10 |
+| Task 2 | Max ghost specialty penalty | 0.10 |
+| Task 2 | Efficiency: step 1–2 | 1.00× |
+| Task 2 | Efficiency: step 3 | 0.85× |
+| Task 2 | Efficiency: step 4+ | 0.70× |
+| Task 2 | Max predicted specialties | 8 |
+| Task 3 | Diagnosis coverage weight | 0.30 |
+| Task 3 | Disposition accuracy weight | 0.20 |
+| Task 3 | Medication F1 weight | 0.20 |
+| Task 3 | LOS accuracy weight | 0.15 |
+| Task 3 | Structure score weight | 0.10 |
+| Task 3 | Information density weight | 0.05 |
+| Task 3 | Max hallucination penalty | 0.15 |
+| Task 3 | Follow-up structure penalty | 0.05 |
+| Task 3 | Min word count for structure | 100 |
+| Task 3 | Keyword density anti-stuff | 0.08 |
+| Task 3 | Min sentence word count | 5 |
+| Task 3 | LOS tolerance (fraction) | ±25% |
+| Task 4 | Step 2 max | 0.15 |
+| Task 4 | Step 3 max | 0.15 |
+| Task 4 | Note weight at step 10 | 0.60 |
+| Task 4 | Shaping weight at step 10 | 0.40 |
+| Task 4 | Consistency bonus | 0.10 |
+| Task 4 | Trajectory bonus | 0.05 |
+| Task 4 | Revision cost per revision | 0.02 |
+| Task 4 | Max revisions | 2 |
+| Task 4 | Specialty overlap for bonus | ≥50% |
+| GRPO | KL penalty β | 0.04 |
+| GRPO | Top entropy quantile | 0.80 |
+| GRPO | Dead-gradient halt (T1) | 80% zeros |
+| GRPO | Dead-gradient halt (T2-4) | 90% zeros |
+| GRPO | Zero-reward threshold | < 0.12 |
+| Curriculum | Easy pool minimum | 10 patients |
+| Curriculum | Medium/hard minimum | 25 patients |
+| Observation | Max diagnoses shown | 15 |
+| Observation | Task 2 initial diagnoses | 5 |
+| Observation | Max procedures | 10 |
+
+---
+
+## Citation
+
+Johnson, A. E. W., Pollard, T. J., et al.  
+**MIMIC-IV (version 2.2)** — PhysioNet.  
+https://physionet.org/content/mimic-iv-demo/2.2/

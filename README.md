@@ -14,8 +14,7 @@ tags:
 
 # MIMIC Discharge Planning — OpenEnv
 
-A clinical RL benchmark where an LLM agent makes real hospital discharge decisions on 233 MIMIC-IV patient records.  Built for the **Meta × Scaler OpenEnv Hackathon**.
-
+A clinical RL benchmark where an LLM agent makes real hospital discharge decisions on real patient records (collected by MIT [MIMIC-IV](https://physionet.org/content/mimic-iv-demo/2.2/)). Built for the **Meta × Scaler OpenEnv Hackathon**.
 ---
 
 ## The Problem
@@ -36,14 +35,6 @@ These decisions happen under extreme time pressure, with incomplete information,
 
 ## Environment
 
-```
-POST /reset  →  patient observation (structured EHR + demographics)
-POST /step   →  reward (0–1) + partial component scores + done flag
-GET  /health →  readiness probe
-GET  /tasks  →  full task catalogue + scoring formulas
-GET  /state  →  current episode state + ground truth (debug only)
-```
-
 **233 real hospital admissions** sourced from the MIMIC-IV demo dataset, categorized by clinical complexity. This can be scaled to the **full MIMIC-IV dataset**, which includes over **50,000 patients**.
 
 | Tier | Count | Profile |
@@ -53,6 +44,14 @@ GET  /state  →  current episode state + ground truth (debug only)
 | Hard | 103 | SNF / hospice / ICU / expired — complex trajectories, rare outcomes |
 
 The environment exposes **structured EHR data per patient**: ICD diagnoses, active/stopped medications, lab flags, vitals, ICU procedures (ventilation hours, dialysis), microbiology cultures, DRG severity/mortality codes, care trajectory, and discharge orders.
+
+```
+POST /reset  →  patient observation (structured EHR + demographics)
+POST /step   →  reward (0–1) + partial component scores + done flag
+GET  /health →  readiness probe
+GET  /tasks  →  full task catalogue + scoring formulas
+GET  /state  →  current episode state + ground truth (debug only)
+```
 
 ---
 

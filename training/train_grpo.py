@@ -34,23 +34,6 @@ Visualisations  (logs/plots/, updated every chunk)
   08_vram_usage.png        GPU VRAM over time (MB)
   09_entropy_loss.png      TRL entropy + loss + clipped-ratio
 
-All bugs fixed vs previous versions
--------------------------------------
-  reward_funcs=[fn]         list required in TRL >= 0.9
-  completions not responses TRL >= 0.12 rename
-  processing_class          TRL >= 0.9 rename from tokenizer
-  warmup_steps not ratio    TRL >= 5.2
-  max_completion_length=512 was 256; JSON was truncated 100% of the time
-  num_generations=8         was 4; advantage washed out with 4 gens
-  batch_size=2 / accum=8   L4 VRAM budget (effective batch stays 16)
-  Trainer re-instantiated   avoids stale LR scheduler + dataloader
-  Zero-warn threshold=40    avoids false alarms in early steps
-  Truncation monitor        warns when >50% of completions are cut off
-  _normalize_action called  fixes flat/mistyped JSON before env step
-  _format_score blended     non-zero reward for valid JSON structure
-  temperature=0.9 / top_p   encourages diverse generations for GRPO
-  dead-gradient threshold   raised 60%→80% (was too aggressive early)
-
 Usage
 -----
   # Fresh run
@@ -890,10 +873,6 @@ _REQUIRED_FIELDS: Dict[int, List[str]] = {
     4: ["final_note"],
 }
 
-# Default actions used to advance Task 4 env from step 1→9 so that all patient
-# info is revealed (labs at step 2, meds at step 4, etc.) before the model's
-# final_note (step 10) is submitted.  These produce reward=0 — they just
-# unlock the progressive info gates without contributing to the grader score.
 _T4_ADVANCE_DEFAULTS: List[Dict] = [
     {"task_id": 4, "task4": {"triage_level": "icu"}},
     {"task_id": 4, "task4": {"priority_labs": ["CBC", "BMP", "LFTs"], "priority_consults": ["Primary Care"]}},
