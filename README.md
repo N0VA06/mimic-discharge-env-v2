@@ -191,7 +191,7 @@ Each phase auto-scales seed dataset to 2× patient pool (every patient appears �
 | Phase 4 | ICU Workflow | 450–549 | Very Hard | **~0.26 → 0.38** — sparse reward, gradual improvement | **~0.27–0.65 (avg ~0.46)** — higher due to shaping + strong base generation |
 
 > **Overall Average:**  
-> Fine-tuned: **~0.53–0.54** vs Baseline: **~0.47** → **+13–15% improvement**
+> Fine-tuned: **~0.53–0.54** vs Baseline: **~0.47** → **+6–7 points, ~13–15% relative improvement**
 
 ### Per-Task Learning Curves
 
