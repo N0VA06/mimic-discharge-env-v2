@@ -24,4 +24,3 @@ pyyaml
 python-dotenv
 
 openenv-core
-uv

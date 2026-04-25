@@ -25,6 +25,10 @@ build/
 .env
 .env.local
 
+# Test / dev scripts
+smoke_test.py
+streetest.py
+
 # Docs (already in README)
 explanation.md
 baseline_results.txt

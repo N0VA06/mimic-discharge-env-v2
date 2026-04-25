@@ -17,8 +17,8 @@ load_dotenv()
 # ── Config ────────────────────────────────────────────────────────────────────
 ENV_URL      = os.getenv("ENV_URL",      "http://localhost:7860")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME   = os.getenv("MODEL_NAME",   "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
-HF_TOKEN     = os.getenv("HF_TOKEN",     "")
+MODEL_NAME   = os.getenv("MODEL_NAME",   "meta-llama/Llama-3.1-8B-Instruct")
+HF_TOKEN     = os.getenv("HF_TOKEN",     "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")
 BENCHMARK    = "mimic-discharge-planning"
 MAX_STEPS    = 10
 
@@ -721,7 +721,8 @@ def _call_llm(prompt: str, max_tokens: int) -> Optional[str]:
             max_tokens=max_tokens,
             temperature=0.1,
         )
-        return resp.choices[0].message.content.strip()
+        content = resp.choices[0].message.content
+        return content.strip() if content else None
     except Exception as e:
         print(f"[WARN] LLM call failed: {e}", flush=True)
         return None
@@ -828,7 +829,9 @@ def run_episode(task_id: int) -> float:
         for step in range(1, max_steps + 1):
             try:
                 step_num    = obs.get("step_num", step)
-                action_dict = _get_action_dict(obs, task_id, step_num)
+                # T4_SCHEMA keys are 1-indexed; env step_num is 0-indexed (0 before any step taken)
+                t4_step     = (step_num + 1) if task_id == 4 else step_num
+                action_dict = _get_action_dict(obs, task_id, t4_step)
                 action      = _build_action(action_dict, task_id)
                 result      = env.step(action)
 
