@@ -14,6 +14,10 @@ tags:
 
 # MIMIC Discharge Planning — OpenEnv
 
+🏆 **Top 100 Project (out of 50,000+ developers) in the Meta × Scaler OpenEnv Hackathon**
+
+📜 [View Certificate](https://drive.google.com/file/d/16_DsUqYRCD6VKYgqKy2QAcRMb_jXs6rx/view?usp=sharing)
+
 A clinical RL environment where an LLM agent makes real hospital discharge decisions on real patient records (collected by MIT [MIMIC-IV](https://physionet.org/content/mimic-iv-demo/2.2/)). Built for the **Meta × Scaler OpenEnv Hackathon**.
 
 **[🚀 Live Environment : https://iinovaii-mimic-discharge-env-v2.hf.space/](https://iinovaii-mimic-discharge-env-v2.hf.space/)**
