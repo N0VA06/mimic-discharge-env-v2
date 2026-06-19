@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ENV_URL      = os.getenv("ENV_URL",      "http://localhost:7860")
+ENV_URL      = os.getenv("ENV_URL",      "https://iinovaii-mimic-discharge-env-v2.hf.space")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME",   "meta-llama/Llama-3.1-8B-Instruct")
 HF_TOKEN     = os.getenv("HF_TOKEN",     "")
@@ -781,7 +781,14 @@ def _build_action(d: Dict, task_id: int):
         ))
     if task_id == 4:
         t = d.get("task4", {})
-        return Action(task_id=4, task4=Task4Action(**{k: v for k, v in t.items() if v is not None}))
+        safe = {}
+        for k, v in t.items():
+            if v is None:
+                continue
+            if k == "revision" and not isinstance(v, dict):
+                continue
+            safe[k] = v
+        return Action(task_id=4, task4=Task4Action(**safe))
 
     raise ValueError(f"Unknown task_id: {task_id}")
 

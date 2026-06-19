@@ -276,9 +276,10 @@ training:
   framework:         "TRL GRPOTrainer + Unsloth (optional)"
   base_model:        "Qwen/Qwen2.5-3B-Instruct (recommended)"
   curriculum_phases:
-    phase_1: {steps: "0-999",    task: 1, noise: clean,   curriculum: easy_only}
-    phase_2: {steps: "1000-2999", task: 2, noise: partial, curriculum: medium_only}
-    phase_3: {steps: "3000+",   task: 3, noise: noisy,   curriculum: random}
+    phase_1: {steps: "0-199",   task: 1, difficulty: easy,      noise: clean,   curriculum: medium_only, pool: 130, seed_n: 220, description: "Discharge Disposition"}
+    phase_2: {steps: "200-349", task: 2, difficulty: medium,    noise: clean,   curriculum: medium_only, pool: 109, seed_n: 220, description: "Care Plan Recommendation"}
+    phase_3: {steps: "350-449", task: 3, difficulty: hard,      noise: partial, curriculum: random,      pool: 233, seed_n: 466, description: "Discharge Note Generation"}
+    phase_4: {steps: "450-549", task: 4, difficulty: very_hard, noise: partial, curriculum: hard_only,   pool: 103, seed_n: 210, description: "ICU Admission-to-Discharge Workflow"}
   dead_gradient_guard:
     metric: task1_zero_reward_rate
     window: 50

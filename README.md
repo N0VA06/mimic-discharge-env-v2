@@ -16,21 +16,68 @@ tags:
 
 A clinical RL environment where an LLM agent makes real hospital discharge decisions on real patient records (collected by MIT [MIMIC-IV](https://physionet.org/content/mimic-iv-demo/2.2/)). Built for the **Meta × Scaler OpenEnv Hackathon**.
 
+**[🚀 Live Environment : https://iinovaii-mimic-discharge-env-v2.hf.space/](https://iinovaii-mimic-discharge-env-v2.hf.space/)**
+
+**[🚀 Hugging Face Space : https://huggingface.co/spaces/IINOVAII/mimic-discharge-env-v2/](https://huggingface.co/spaces/IINOVAII/mimic-discharge-env-v2/)**
+
 ---
 
 ## The Problem
 
 **Every year ~20% of Medicare patients are readmitted within 30 days — costing $26B and representing systematic failures in discharge planning.**
 
-Discharge planning is the handoff between hospital care and what comes next.  A attending phyiscian must simultaneously decide:
+Discharge planning is the handoff between hospital care and what comes next. An attending physician must simultaneously decide:
 
-- Where patients go next (home, SNF, rehab, hospice?)
+- Where patients go next (home, nursing facility, rehab, end-of-life care?)
 - What medications continue & who follows up
 - What instructions go in the discharge note
 
 All under time pressure with incomplete information.
 
-**This environment is tractable for RL:** every decision has a ground-truth answer in MIMIC-IV, all graders are deterministic, reward decomposes into clinically meaningful signals.
+**This environment is tractable for RL:** every decision has a ground-truth answer in MIMIC-IV, all graders are deterministic, and reward decomposes into clinically meaningful signals.
+
+---
+
+## Training Results
+
+> **A 3B model trained for 7 hours on a single L4 GPU matches or outperforms an 8B zero-shot baseline on 3 of 4 clinical tasks — despite having 2.6× fewer parameters.**
+
+| Task | Difficulty | Fine-Tuned · Qwen2.5-3B + GRPO | Baseline · Llama-3.1-8B | Delta |
+|------|------------|-------------------------------|-------------------------|-------|
+| Task 1 — Disposition | Easy | **0.73** (peak, from 0.24) | ~0.11 avg | **+0.62 ✅** |
+| Task 2 — Care Plan | Medium | **~0.62** avg | ~0.68 avg | −0.06 |
+| Task 3 — Discharge Note | Hard | **~0.47** avg | ~0.51 avg | −0.04 |
+| Task 4 — ICU Workflow | Very Hard | **0.26 → 0.38** (↑ learning) | ~0.46 avg (flat) | ↑ trending |
+| **Overall** | — | **~0.53–0.54** | **~0.47** | **+13–15%** |
+
+The biggest win is Task 1: RL training teaches the 3B model to read specific clinical signals (diagnosis codes, mortality risk scores, ventilator use) that a larger zero-shot model misses entirely under the strict canonical grader. On Tasks 2–3, general language reasoning keeps the baseline competitive, but the fine-tuned model is catching up with far fewer parameters. Task 4's sparse reward means the upward trajectory (0.26 → 0.38 over 100 steps) matters more than the snapshot average.
+
+### Reward Curve
+
+![Reward Curve](logs/plots/01_reward_curve.png)
+*Per-step mean reward across all 550 training steps (global step on x-axis, reward 0–1 on y-axis). Coloured bands mark the four curriculum phases; the dark line is the rolling-50 mean. Peak of 0.73 is reached at step ~195 (end of Task 1).*
+
+### Per-Task Learning Curves
+
+![Per-Task Learning Curves](logs/plots/08_per_task_curves.png)
+*Reward trajectory broken out per task (2×2 grid). Each panel x-axis is the global training step for that phase; y-axis is mean reward 0–1. Dashed line = phase mean; solid line = rolling mean. Task 1 shows the steepest climb; Task 4 shows steady improvement despite sparse reward.*
+
+### Curriculum Phase Timeline
+
+![Phase Timeline](logs/plots/05_phase_timeline.png)
+*Rolling-50 reward over the full 550-step curriculum. Vertical dashed lines mark phase transitions (steps 200, 350, 450). Reward dips at each task switch then recovers — the signature of curriculum transfer learning.*
+
+### JSON Parse Rate
+
+![Parse Rate](logs/plots/02_parse_rate.png)
+*Fraction of rollouts that produce valid, parseable JSON per training step. Target floor is 80% (red dashed). Stays ≥95% through Tasks 1–2; drops to ~85% in Task 3 (7-section note JSON); brief dip to ~75% at the Task 4 format switch, recovering to ~90% by step 549.*
+
+### Reward Distribution
+
+![Reward Histogram](logs/plots/06_reward_histogram.png)
+*Distribution of all per-sample rewards across the full training run. Bimodal structure: cluster at 0.24–0.44 (partial credit) and spread from 0.50–0.80 (good clinical reasoning). Spike at 1.0 = exact matches on Task 1 dispositions; Task 4 mode at 0.30–0.40 reflects the 0.60× note-score cap.*
+
+[→ Full per-task breakdown and takeaways](blog.md#fine-tuned-vs-baseline)
 
 ---
 
@@ -40,23 +87,23 @@ All under time pressure with incomplete information.
 |-----------|---------|
 | **4 tasks** | disposition (easy) → care plan (medium) → discharge note (hard) → full workflow (very hard) |
 | **233 episodes** | Stratified by complexity: easy (21) / medium (109) / hard (103) |
-| **Structured EHR** | ICD diagnoses, medications, labs, vitals, ICU procedures, microbiology, DRG codes |
+| **Structured patient records** | Diagnoses, medications, lab results, vital signs, ICU procedures, infection tests, hospital billing codes |
 | **Deterministic graders** | No randomness; all scoring fully specified + explainable |
-| **Partial rewards** | Every task emits component signals (specialty F1, medication F1, etc.) alongside scalar score |
+| **Partial rewards** | Every task emits component signals (specialist accuracy, medication accuracy, etc.) alongside scalar score |
 
 ---
 
 ## Environment
 
-**233 real hospital admissions** sourced from the MIMIC-IV demo dataset, categorized by clinical complexity. This can be scaled to the **full MIMIC-IV dataset**, which includes over **50,000 patients**.
+**233 real hospital admissions** sourced from the MIMIC-IV demo dataset, categorized by clinical complexity. This can be scaled to the **[Full MIMIC-IV](https://physionet.org/content/mimiciv/3.1/)**, which includes over **364,627 patients**.
 
 | Tier | Count | Profile |
 |------|-------|---------|
-| Easy | 21 | Short LOS, no ICU, plain home discharge — trivial, no discrimination needed |
+| Easy | 21 | Short hospital stay, no intensive care, plain home discharge — straightforward |
 | Medium | 109 | 56% home-with-services / 39% home — requires reading clinical features |
-| Hard | 103 | SNF / hospice / ICU / expired — complex trajectories, rare outcomes |
+| Hard | 103 | Nursing facility / hospice / intensive care / died — complex cases, rare outcomes |
 
-The environment exposes **structured EHR data per patient**: ICD diagnoses, active/stopped medications, lab flags, vitals, ICU procedures (ventilation hours, dialysis), microbiology cultures, DRG severity/mortality codes, care trajectory, and discharge orders.
+The environment exposes **structured patient record data per admission**: diagnoses, active/stopped medications, lab results, vital signs, ICU procedures (ventilation, dialysis), infection test results, hospital billing severity codes, care trajectory, and discharge orders.
 
 ```
 POST /reset  →  patient observation (structured EHR + demographics)
@@ -72,41 +119,39 @@ GET  /state  →  current episode state + ground truth (debug only)
 
 ### Task 1 — Discharge Disposition *(1 step)*
 
-Predict one of 8 canonical post-discharge placements from the patient's full EHR.
+Predict where a patient goes after leaving the hospital — from their full medical record.
 
-| Value | Clinical meaning |
-|-------|-----------------|
-| `home` | Fully independent, no professional follow-up |
-| `home_with_services` | Visiting nurse, home PT, IV antibiotics, wound care |
-| `snf` | Skilled nursing facility — 24h nursing + ongoing medical needs |
-| `rehab` | Inpatient rehabilitation — intensive PT/OT, medically stable |
-| `hospice` | Terminal prognosis, comfort-focused care only |
-| `ama` | Left against medical advice |
+| Value | Meaning |
+|-------|---------|
+| `home` | Goes home independently, no professional follow-up needed |
+| `home_with_services` | Goes home with visiting nurse, home physical therapy, or wound care |
+| `snf` | Skilled nursing facility — around-the-clock nursing care for ongoing medical needs |
+| `rehab` | Inpatient rehab center — intensive physical and occupational therapy, medically stable |
+| `hospice` | End-of-life care focused on comfort only |
+| `ama` | Left the hospital against medical advice |
 | `expired` | Patient died during this admission |
-| `other` | Transfer to acute hospital or psychiatric unit |
+| `other` | Transfer to another hospital or psychiatric unit |
 
-**Scoring:** Exact match = 1.0 · Clinically adjacent (e.g. SNF ↔ home-with-services) = 0.50 · Same broad group = 0.25 · Wrong group = 0.0.
-Key signals: ICD V667/Z51.5 → hospice · DRG mortality=4 + malignant neoplasm → hospice · ventilation/dialysis → SNF · orthopedic fixation → rehab · GCS ≤ 5 + terminal dx → hospice.
+**Scoring:** Exact match = 1.0 · Nearby category (e.g. nursing facility ↔ home-with-services) = 0.50 · Same broad group = 0.25 · Wrong group = 0.0.
+Key signals: Patient on a ventilator or dialysis → nursing facility. Bone surgery (hip/knee) → rehab. Terminal diagnosis or very low consciousness level → hospice.
 
-> **Training:** Reward rises **0.24 → 0.73** over steps 0–199 as the model learns to read clinical features (DRG mortality, ventilation hours, ICD codes) to distinguish HOME / HOME\_WITH\_SERVICES / SNF / hospice.
+> **Training:** Reward rises **0.24 → 0.73** over steps 0–199 as the model learns to read clinical features (mortality risk scores, ventilator use, diagnosis codes) to distinguish home / home-with-services / nursing facility / hospice.
 
 ---
 
 ### Task 2 — Care Plan Recommendation *(≤4 steps, efficiency-discounted)*
 
-A **gated multi-step** task.  The agent starts with minimal data (demographics + top diagnoses only), then requests additional information before submitting a care plan.
+A **gated multi-step** task. The agent starts with minimal data (demographics + top diagnoses only), then requests additional information before submitting a care plan.
 
-**Optimal strategy:** Request `labs + medications + microbiology` on step 1, submit plan on step 2 — earns a 1.0× efficiency multiplier.  Step 3 = 0.85×.  Step 4 = 0.70×.
+**Optimal strategy:** Request `labs + medications + microbiology` on step 1, submit plan on step 2 — earns a 1.0× efficiency multiplier. Step 3 = 0.85×. Step 4 = 0.70×.
 
 The submitted plan must specify:
-- **Follow-up specialties** derived from ICD codes (Cardiology from `I` prefix, Nephrology from `N`, Infectious Disease from organisms in microbiology, etc.)
-- **Medications to continue** — exact names from `pharmacy_active` only
-- **Medications to discontinue** — exact names from `pharmacy_stopped` only
+- **Follow-up specialist appointments** — which doctor specialties to see (e.g. heart conditions → cardiologist, kidney disease → nephrologist, infections → infectious disease specialist)
+- **Medications to keep taking** — exact names from the patient's active prescription list
+- **Medications to stop** — exact names from the list of discontinued prescriptions
 - **5 specific home instructions** with numeric thresholds (e.g. "call if temperature > 38.5°C")
 
-**Scoring:** `0.35 × specialty_F1 + 0.25 × medication_F1 + 0.25 × instruction_quality + 0.15 × discontinue_accuracy − hallucination_penalty − ghost_specialty_penalty × step_efficiency`.
-
-Ghost specialty penalty fires when the agent recommends a specialty with no supporting ICD code.
+**Scoring:** Weighted across specialist accuracy (35%), medication accuracy (25%), instruction quality (25%), and discontinued medication accuracy (15%). Penalties apply for inventing specialists the patient's diagnoses don't support, or hallucinating drug names.
 
 > **Training:** Stabilizes at **~0.58–0.65** over steps 200–349 with specialty F1 and medication F1 both contributing. Efficiency multiplier rewards the optimal 2-step strategy (request labs/meds/micro → submit plan).
 
@@ -117,16 +162,16 @@ Ghost specialty penalty fires when the agent recommends a specialty with no supp
 Write a complete clinical discharge summary (minimum 300 words) covering all 7 required sections in order:
 
 1. PRINCIPAL DIAGNOSIS
-2. BRIEF HOSPITAL COURSE *(must state LOS in days numerically)*
+2. BRIEF HOSPITAL COURSE *(must state how many days the patient was hospitalized)*
 3. KEY PROCEDURES PERFORMED
 4. DISCHARGE CONDITION
-5. DISCHARGE DISPOSITION *(exact canonical phrase — 6 options)*
-6. DISCHARGE MEDICATIONS *(only `pharmacy_active` drugs by exact name)*
+5. DISCHARGE DISPOSITION *(exact phrasing — 6 options)*
+6. DISCHARGE MEDICATIONS *(currently prescribed medications, exact names only)*
 7. FOLLOW-UP INSTRUCTIONS
 
-**Scoring:** `0.30 × diagnosis_coverage + 0.20 × disposition_accuracy + 0.20 × medication_F1 + 0.15 × LOS_accuracy + 0.10 × structure_score + 0.05 × information_density − hallucination_penalty`.
+**Scoring:** Weighted across diagnosis coverage (30%), discharge destination accuracy (20%), medication accuracy (20%), length-of-stay accuracy (15%), document structure (10%), and information density (5%) — minus a penalty for invented facts.
 
-Anti-stuffing: diagnosis keywords must appear in sentences ≥5 words.  A sentence matching ≥3 diagnoses simultaneously scores zero (vague catch-all detection).  Drug names verified against both `prescriptions` and `emar_summary`.
+Quality check: diagnoses must appear in real sentences (≥5 words each). A sentence listing 3 or more diagnoses at once scores zero — the model must write coherent notes, not cram keywords. Drug names verified against both prescription records and medication administration records.
 
 > **Training:** Reaches **~0.40–0.55** over steps 350–449 with high variance — long-form generation creates a harder reward signal. Parse rate drops to ~85% due to complex 7-section JSON structure.
 
@@ -134,24 +179,24 @@ Anti-stuffing: diagnosis keywords must appear in sentences ≥5 words.  A senten
 
 ### Task 4 — ICU Admission-to-Discharge Workflow *(10 steps, sparse reward)*
 
-Sequential clinical decision-making across a full ICU admission.  Sparse reward: steps 1–9 return 0, only step 10 (final discharge note) returns a score.
+Sequential clinical decision-making across a full ICU admission. Sparse reward: steps 1–9 return 0, only step 10 (final discharge note) returns a score.
 
 | Step | Decision |
 |------|----------|
-| 1 | Acuity triage: ICU / stepdown / floor |
-| 2 | Priority labs + specialist consults |
-| 3 | Interventions: ventilation, dialysis, lines |
-| 4 | High-risk medication identification |
-| 5 | Antibiotic stewardship plan |
-| 6 | Fluid management strategy |
-| 7 | ICU-to-stepdown readiness + barriers |
-| 8 | Predicted disposition + LOS estimate |
-| 9 | Discharge medication reconciliation |
+| 1 | How sick is the patient? (Intensive care / step-down ward / regular ward) |
+| 2 | Which lab tests and specialist doctors are needed |
+| 3 | Key treatments needed: breathing support, kidney dialysis, IV lines |
+| 4 | Which medications carry high risk and need close monitoring |
+| 5 | Choosing the right antibiotics |
+| 6 | Managing IV fluid intake and output |
+| 7 | Is the patient ready to move from intensive care to a less intensive ward? |
+| 8 | Predicted discharge destination + expected days remaining |
+| 9 | Final medication review before discharge |
 | 10 | Final discharge note (composite reward) |
 
 Step 10 score = `note_score × 0.60 + shaping_avg × 0.40 + consistency_bonus (0.10) + trajectory_bonus (0.05) − revision_cost`.
 
-> **Training:** Sparse reward (steps 1–9 return 0) makes this the hardest phase. The model transfers note-writing knowledge from Task 3 and adapts to the ICU workflow wrapper. Mean reward builds from **~0.26 → 0.38** over steps 450–549 as parse rate recovers and consistency/trajectory bonuses accumulate.
+> **Training:** Sparse reward (steps 1–9 return 0) makes this the hardest phase. The model transfers note-writing knowledge from Task 3 and adapts to the full ICU workflow. Mean reward builds from **~0.26 → 0.38** over steps 450–549 as the model learns to keep its decisions consistent across all 10 steps.
 
 ---
 
@@ -173,49 +218,7 @@ Step 10 score = `note_score × 0.60 + shaping_avg × 0.40 + consistency_bonus (0
 
 Each phase auto-scales seed dataset to 2× patient pool (every patient appears ≥2× per chunk).
 
-[→ Full training details](explanation.md#training-pipeline)
-
----
-
-## Training Results
-
-### Reward Curve
-
-![Reward Curve](logs/plots/01_reward_curve.png)
-
-| Phase | Task | Steps | Difficulty | Fine-Tuned Model | Baseline (Llama-3.1-8B-Instruct) |
-|-------|------|-------|------------|------------------|----------------------------------|
-| Phase 1 | Disposition | 0–199 | Easy | **0.24 → 0.73** — learns HOME vs HOME_WITH_SERVICES from clinical features | **~0.05–0.30 (avg ~0.11)** — struggles with exact class matching under strict reward |
-| Phase 2 | Care Plan | 200–349 | Medium | **~0.58–0.65** — stable specialty + medication F1 | **~0.60–0.73 (avg ~0.68)** — strong due to general reasoning ability |
-| Phase 3 | Discharge Note | 350–449 | Hard | **~0.40–0.55** — high variance, long-form difficulty | **~0.43–0.59 (avg ~0.51)** — comparable performance |
-| Phase 4 | ICU Workflow | 450–549 | Very Hard | **~0.26 → 0.38** — sparse reward, gradual improvement | **~0.27–0.65 (avg ~0.46)** — higher due to shaping + strong base generation |
-
-> **Overall Average:**  
-> Fine-tuned: **~0.53–0.54** vs Baseline: **~0.47** → **+6–7 points, ~13–15% relative improvement**
-
-### Per-Task Learning Curves
-
-![Per-Task Learning Curves](logs/plots/08_per_task_curves.png)
-
-Each panel shows reward across that task's training steps.  Task 1 has the steepest learning curve (simple classification). Task 4 starts lower due to sparse reward and the 9-step zero-reward advance per episode, but improves steadily as the model adapts the note-writing skills from Task 3.
-
-### Curriculum Phase Timeline
-
-![Phase Timeline](logs/plots/05_phase_timeline.png)
-
-Rolling-50 reward peaks at **0.73 at step ~195** (end of Task 1 phase), dips at each curriculum switch, then recovers. Task 4 shows a shallower dip than Task 2 because the model already knows how to write discharge notes — it only needs to adapt to the ICU workflow wrapper and sparse reward signal.
-
-### JSON Parse Rate
-
-![Parse Rate](logs/plots/02_parse_rate.png)
-
-Stays at **≥95% through Tasks 1 and 2**.  Drops to ~85% in Task 3 (7-section JSON) and briefly to ~75% at the Task 4 switch (new `final_note` wrapper format), recovering to ~90% by step 549.
-
-### Reward Distribution
-
-![Reward Histogram](logs/plots/06_reward_histogram.png)
-
-Bimodal: cluster at 0.24–0.44 (partial credit — adjacent disposition or incomplete note) and a spread from 0.50–0.80 (good clinical reasoning).  Spike at 1.0 = exact matches on Task 1 dispositions. Task 4 adds a mode at 0.30–0.40 reflecting the 0.60× note-score cap in the grader formula.
+[→ Full training details](blog.md#training-pipeline)
 
 ---
 
@@ -223,12 +226,20 @@ Bimodal: cluster at 0.24–0.44 (partial credit — adjacent disposition or inco
 
 | Problem | Symptom | Fix |
 |---------|---------|-----|
-| **Hospice mode collapse** | Model output `hospice` 100% for 42 steps | Automatically switches to include class diversity; if only a single class is present, it defaults to including the “easy” category. |
+| **Hospice mode collapse** | Model output `hospice` 100% for 42 steps | Automatically switches to include class diversity; if only a single class is present, it defaults to including the "easy" category. |
 | **Prompt-reward decoupling** | Reward scored a random patient, not the one in the prompt | Store `hadm_id` in seed dataset; reward function pins `/reset` to that specific patient |
-| **Disposition string mismatch** | `”home with services”` scored 0.44 instead of 1.0 | Normalize `→ HOME_WITH_SERVICES` before env call |
+| **Disposition string mismatch** | `"home with services"` scored 0.44 instead of 1.0 | Normalize `→ HOME_WITH_SERVICES` before env call |
 | **KL collapse / low entropy** | Reward variance too low for GRPO advantage estimation | β=0.04 KL penalty + top_entropy_quantile=0.8 (drop bottom 20% entropy completions) |
 
-[→ Full technical deep-dive](explanation.md)
+[→ Full technical deep-dive](blog.md)
+
+---
+
+## Demo
+
+[![Watch the video](https://img.youtube.com/vi/hKE8422zt2k/0.jpg)](https://youtu.be/hKE8422zt2k?cc_load_policy=1)
+
+---
 
 ## Project Structure
 
@@ -283,12 +294,14 @@ curl localhost:7860/health     # → {"status":"ok","episodes_available":233}
 
 **Train (7-hour L4 budget):**
 ```bash
+pip install unsloth accelerate peft matplotlib datasets # not in requirements.txt to keep docker image lean
 python -m training.train_grpo \
   --model_name Qwen/Qwen2.5-3B-Instruct \
   --env_url http://localhost:7860 \
   --max_steps 550
 ```
-Install unsloth accelerate trl datasets peft (pip install unsloth accelerate trl datasets peft)
+
+Install: `pip install unsloth accelerate trl datasets peft`
 
 **Collect offline rollouts:**
 ```bash
@@ -328,6 +341,18 @@ docker run -p 7860:7860 -e HF_TOKEN=hf_... mimic-discharge-env
 
 ---
 
+## Presentation
+
+[View slides](https://canva.link/swa5x39lx1vlzwi)
+
+---
+
 ## Citation
 
-Johnson et al., **MIMIC-IV (v2.2)**, PhysioNet. https://physionet.org/content/mimic-iv-demo/2.2/
+Johnson, A. E. W., et al.  
+**MIMIC-IV (version 3.1)**, PhysioNet.  
+https://physionet.org/content/mimiciv/3.1/
+
+Johnson, A., et al.  
+**MIMIC-IV Clinical Database Demo (version 2.2)**, PhysioNet.  
+https://physionet.org/content/mimic-iv-demo/2.2/

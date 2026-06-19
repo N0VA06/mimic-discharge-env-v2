@@ -1,11 +1,9 @@
 """
 GRPO training — MIMIC Discharge Planning
 =========================================
-Hardware target : 1x NVIDIA L4  (24 GB VRAM, 28 vCPU, 124 GB RAM)
 Model           : Qwen/Qwen2.5-3B-Instruct  (bfloat16, LoRA r=16)
-Framework       : TRL >= 0.12  +  Transformers >= 4.40
 
-Curriculum  (7-hour L4 GPU budget — 550 total steps)
+Curriculum 
 ----------
   Steps    0 -  199 : Task 1  noise=clean    curriculum=medium_only  (200 steps ~1.9h)
   Steps  200 -  349 : Task 2  noise=clean    curriculum=medium_only  (150 steps ~1.5h)
@@ -22,18 +20,6 @@ Checkpointing & Resume
   This reloads LoRA weights + full training state (step, chunk,
   zero-reward buffers, elapsed time) and continues exactly where it stopped.
 
-Visualisations  (logs/plots/, updated every chunk)
----------------------------------------------------
-  01_reward_curve.png      raw + rolling-50 reward over time
-  02_parse_rate.png        JSON parse-success rate
-  03_dead_gradient.png     Task-1 zero-reward monitor
-  04_reward_by_task.png    box-plot per task
-  05_phase_timeline.png    curriculum phases + reward
-  06_reward_histogram.png  reward distribution with banded zones
-  07_chunk_summary.png     per-chunk mean reward bar chart
-  08_vram_usage.png        GPU VRAM over time (MB)
-  09_entropy_loss.png      TRL entropy + loss + clipped-ratio
-
 Usage
 -----
   # Fresh run
@@ -43,7 +29,7 @@ Usage
   python -m training.train_grpo --resume_from ./checkpoints/chunk_004
 
   # Re-plot only
-  python -m training.train_grpo --replot ./logs/training_20240101_120000.jsonl
+  python -m training.train_grpo --replot ./logs/training_20260426_134017_fresh.jsonl
 """
 from __future__ import annotations
 
@@ -60,8 +46,6 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import warnings
 
-# ── Silence noisy but harmless deprecation warnings ───────────────────────────
-# 1. Transformers 5.3 deprecated AttentionMaskConverter; removed in 5.10
 warnings.filterwarnings(
     "ignore",
     message=".*AttentionMaskConverter.*",
@@ -72,8 +56,6 @@ warnings.filterwarnings(
     message=".*attention mask API.*",
     category=FutureWarning,
 )
-# 2. Unsloth/TRL passes both generation_config + loose kwargs in Transformers 5.3
-#    max_new_tokens=512 correctly takes precedence; warning is cosmetic only
 warnings.filterwarnings(
     "ignore",
     message=".*Passing `generation_config` together with generation-related arguments.*",
@@ -113,16 +95,10 @@ ZERO_WARN_AFTER   = 40     # buffer fill before firing zero-rate warning
 LORA_R            = 16
 MIN_EASY_POOL     = 10    # easy tier works with fewer patients (home-discharge cases, no hospice)
 MIN_TIER_POOL     = 25    # minimum for medium/hard tier curriculum
-# Rewards below this threshold are counted as "zero" in zero_bufs.
-# Must be above the wrong-task-key floor (e.g. task2 wrong key → 0.030)
-# but below the minimum valid same-task reward (task2 correct key, env=0 → 0.15).
 ZERO_REWARD_THRESHOLD = 0.12
 # Dead-gradient stop thresholds per task (fraction of "near-zero" rewards).
 DEAD_THRESHOLDS       = {1: 0.80, 2: 0.90, 3: 0.90, 4: 0.90}
 
-# Minimum seed-dataset size per curriculum mode: at least 2× the unique patient pool
-# so every patient appears at least twice per chunk and the model sees full diversity.
-# Pool sizes confirmed from MIMIC demo: easy=21, medium=109, hard=103, total=233.
 _SEED_N_BY_MODE: Dict[str, int] = {
     "easy_only":   44,   # 21 × 2
     "medium_only": 220,  # 109 × 2  (T1 + T2)
@@ -249,17 +225,7 @@ def _pick_mode(mode: str, pool_sizes: Dict[str, int]) -> str:
 
 # ── Curriculum ────────────────────────────────────────────────────────────────
 
-# Desired tier per phase.  _resolve_mode() will downgrade to "random" at
-# runtime if the actual patient count in a tier is below MIN_TIER_POOL.
 _CURRICULUM_PREFERRED = {
-    # (step_lo, step_hi): (task_id, noise_level, preferred_curriculum_mode)
-    #
-    # 7-hour L4 GPU budget: 550 total steps.
-    # T1/T2 ~35 s/step (short outputs); T3/T4 ~55-60 s/step (long outputs).
-    # Phase 1: medium_only — forces HOME vs HOME_WITH_SERVICES discrimination.
-    # Phase 2: Task 2 care plan, medium patients.
-    # Phase 3: Task 3 discharge note, random (all 233 patients).
-    # Phase 4: Task 4 ICU workflow (final_note), hard patients.
     (0,   199): (1, "clean",   "medium_only"),
     (200, 349): (2, "clean",   "medium_only"),
     (350, 449): (3, "partial", "random"),
@@ -1217,9 +1183,6 @@ def build_seed_dataset(
                     if enriched:
                         obs = enriched
             if task_id == 4:
-                # Advance env through steps 1-9 so all fields are revealed in the
-                # prompt (labs at step 2, meds at step 4, etc.).  These default
-                # actions return reward=0 and just unlock the info gates.
                 for adv_action in _T4_ADVANCE_DEFAULTS:
                     try:
                         r4 = _env_post(env_url, "/step", adv_action)
@@ -1230,13 +1193,6 @@ def build_seed_dataset(
                             obs = enriched
                     except Exception:
                         break
-            # Store as proper message list so TRL applies the chat template
-            # correctly: system prompt in the <|im_start|>system turn, not user.
-            # Train-inference mismatch was the main cause of JSON format failures.
-            #
-            # Also store hadm_id so the reward function can reset to the SAME
-            # patient that generated this prompt, making reward directly measure
-            # "did you correctly classify THIS patient" rather than a random one.
             rows.append({
                 "prompt": [
                     {"role": "system", "content": _SYSTEM_PROMPT},
