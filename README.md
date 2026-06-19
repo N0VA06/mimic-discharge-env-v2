@@ -16,7 +16,7 @@ tags:
 
 🏆 **Top 100 (out of 50,000+ developers) in the Meta × Scaler OpenEnv Hackathon** • 📜 [Certificate](https://drive.google.com/file/d/16_DsUqYRCD6VKYgqKy2QAcRMb_jXs6rx/view?usp=sharing)
 
-A clinical RL environment where an LLM agent makes real hospital discharge decisions using patient records from [MIMIC-IV](https://physionet.org/content/mimic-iv-demo/2.2/), a large-scale critical care dataset developed by MIT and distributed through PhysioNet. Built for the **Meta × Scaler OpenEnv Hackathon**.
+A clinical RL environment where an LLM agent makes real hospital discharge decisions on real patient records (collected by MIT [MIMIC-IV](https://physionet.org/content/mimic-iv-demo/2.2/)).
 
 🚀 **Live Environment:** https://iinovaii-mimic-discharge-env-v2.hf.space/
 
